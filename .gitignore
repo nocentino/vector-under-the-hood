@@ -1,0 +1,22 @@
+# Generated certs (created at first `docker compose up` — reused on subsequent runs)
+certs/nginx.crt
+certs/nginx.key
+
+# StackOverflow sample database backup (~759 MB — downloaded by start.sh)
+backups/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/settings.json
+*.swp
