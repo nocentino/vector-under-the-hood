@@ -113,6 +113,18 @@ Open the three demo scripts in SSMS or the MSSQL extension for VS Code, connect 
 `localhost,1435` as `sa`, and run them in order. Each script explains what you're
 looking at as you go. Run it a section at a time and read the comments.
 
+### Step 4: Try the RAG app
+
+Start the web UI, then open [http://localhost:8501](http://localhost:8501) and ask it a
+programming question:
+
+```bash
+docker compose --profile app up rag-app-ui
+```
+
+Press `Ctrl+C` to stop it. [The RAG App](#the-rag-app) section below has the command-line
+version and more detail.
+
 ---
 
 ## The Demos
@@ -174,7 +186,20 @@ questions and their best answers, and hands that context to `llama3.2` to write 
 answer. SQL Server does the embedding and the search. The app never touches a vector.
 
 It runs in a container, so you don't need Python or an ODBC driver on your machine.
-The image builds the first time you run it:
+The image builds the first time you run it.
+
+### The web UI
+
+Start the web UI, then open [http://localhost:8501](http://localhost:8501) in your browser:
+
+```bash
+docker compose --profile app up rag-app-ui
+```
+
+Press `Ctrl+C` to stop it. Add `-d` to run it in the background, and stop it later with
+`docker compose --profile app stop rag-app-ui`.
+
+### The command line
 
 ```bash
 # Ask one question
@@ -182,9 +207,6 @@ docker compose run --rm rag-app python demos/rag-app.py "how do I undo my last g
 
 # Ask as many as you like
 docker compose run --rm rag-app python demos/rag-app.py
-
-# Or use the web UI at http://localhost:8501
-docker compose --profile app up rag-app-ui
 ```
 
 The first answer can take a minute while Ollama loads `llama3.2`. After that it's faster.
