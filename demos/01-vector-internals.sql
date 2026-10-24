@@ -26,13 +26,13 @@ GO
 
   Run sections top-to-bottom. Every section is idempotent.
 
-  TIME BUDGET: 15 minutes of a 60-minute session.
+  TIME BUDGET: 15 of the 60 demo minutes (75-minute slot, 15 for Q&A).
     1a-1c  storage and catalog       5 min
     1e     float16 (first two queries) 2 min
     3      AI_GENERATE_EMBEDDINGS    3 min
     4-5    distance and kNN plan     5 min
     [OPTIONAL] sections are deep dives for Q&A or a longer slot: 1d, 1e-3
-    onward, and 2.
+    onward, 2, and 5c.
 =============================================================================
 */
 
@@ -238,8 +238,8 @@ DBCC TRACEON(3604);   -- send DBCC output to the Messages tab
 EXEC (@sql);
 DBCC TRACEOFF(3604);
 GO
--- In the Messages tab, look for m_slotCnt = 2 in the page header and two
--- slots, each carrying a ~3 KB vector inline.
+-- In the Messages tab, look for m_slotCnt in the page header (1 or 2) and
+-- the slots, each carrying a ~3 KB vector inline.
 
 
 /* =============================================================================
@@ -636,8 +636,9 @@ GO
 
    One query-shape tip: rank inside the satellite table first, then join to
    Posts for the 10 winners. If you join first, the optimizer can join every
-   row to Posts before the sort. On 3,600 rows that cost 15,506 extra reads
-   on Posts. The CTE below keeps the join to 10 rows.
+   row to Posts before the sort. On 10,100 rows that cost 41,099 reads on
+   Posts, against 40 for rank-then-join. The CTE below keeps the join to
+   10 rows.
 
    SET STATISTICS IO and TIME show exactly what it cost.
    After running this, look at the logical reads in the Messages tab —

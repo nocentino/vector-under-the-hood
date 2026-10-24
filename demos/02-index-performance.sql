@@ -18,13 +18,13 @@ GO
     Demo 1 complete. StackOverflow is restored and QuestionEmbeddings is
     populated. The vec_idx DiskANN index was created at startup by sql-init.
 
-  OPTIONAL — expand to 10,000 rows for a more striking IO contrast:
+  RECOMMENDED — expand to 10,000 rows. The numbers in this file assume it:
     The startup script embeds 1,000 questions. For the full 10,000-row corpus
-    (recommended for §2 IO comparison and §3 recall at scale), run:
+    (needed for §2 IO comparison, §2b scale, and §4f), run:
 
         bash setup/expand-embeddings.sh
 
-    (~25 min on Apple Silicon with Ollama GPU — see script for batch progress).
+    (~30 min on an M2 with Ollama on the host — see script for batch progress).
 
   Connect:
     Server:   localhost,1435
@@ -33,7 +33,7 @@ GO
 
   Run sections top-to-bottom. Every section is idempotent.
 
-  TIME BUDGET: 25 minutes of a 60-minute session.
+  TIME BUDGET: 25 of the 60 demo minutes (75-minute slot, 15 for Q&A).
     1a     how DiskANN works          5 min
     1b-1c  build + where it lives     4 min
     2      IO and scale               6 min
@@ -151,14 +151,14 @@ GO
    We drop and rebuild here so you can see the actual timing. Measured on
    this stack (SQL Server 2025 CU10, Apple Silicon M2):
      1,000 rows    ~11 seconds
-     10,000 rows   ~23 seconds on a warm instance, 125-160 seconds right
-                   after loading the data, and ~340 seconds right after
-                   a container restart
+     10,000 rows   anywhere from ~23 seconds to ~2 minutes on a running
+                   instance, and ~340 seconds right after a restart
    Build time swings a lot with what's cached and what else the box is
    doing. Measure it on your hardware before you size a maintenance window.
 
-   LIVE-DEMO TIP: run one throwaway build before the session so the timed
-   build here lands near the warm number.
+   LIVE-DEMO TIP: budget two minutes. Start the build, then walk back
+   through the GreedySearch diagram in 1a while it runs. If you're short
+   on time, skip the DROP/CREATE and just run 1c against the existing index.
 
    NOTE: SQL Server 2025 (earlier-version DiskANN) makes the table READ-ONLY
    while the vector index exists. Section 4a covers this limitation in detail.
@@ -330,7 +330,7 @@ GO
 --   CPU time            37-63 ms        8-11 ms
 --   Elapsed time        13-28 ms        7-10 ms
 --
--- So ANN wins, but not by the 100× you might expect from "52 graph pages".
+-- So ANN wins, but not by the 100× the graph reads alone (50) might suggest.
 -- The graph itself is cheap (50 reads). Most of the ANN cost is reads on
 -- QuestionEmbeddings itself. The IO suggests the walk fetches the stored
 -- vector for the candidates it scores, much like the paper's full-precision
@@ -347,7 +347,7 @@ GO
    measure it. This batch embeds the query once, then times exact kNN over
    the first 1,000, 2,500, 5,000, and 10,000 rows (a clustered key range, so
    each run reads only its slice) and ANN over the whole table. Each size
-   runs 5 times and we keep the average.
+   runs 10 times and we keep the average.
 
    No Ollama call inside the loop, so you're timing SQL Server, not HTTP.
 ----------------------------------------------------------------------------- */
@@ -422,7 +422,8 @@ GO
 --   - kNN CPU grows linearly with rows. Parallelism can hide that in elapsed
 --     time on an idle box, but under concurrent load you pay the CPU.
 --   - ANN at 10,000 rows costs about what kNN costs at 1,000.
---   - Below a few thousand rows, a vector index isn't worth it (Section 2a).
+--   - Below a few thousand rows, a vector index isn't worth it (see the
+--     1,000-row note at the end of the IO comparison above).
 
 
 /* =============================================================================
@@ -667,7 +668,7 @@ GO
      mxbai-embed-large           1024 dimensions
      text-embedding-3-small      1536 dimensions
      text-embedding-ada-002      1536 dimensions
-     text-embedding-3-large (ADA) 3072 dimensions  → needs float16!
+     text-embedding-3-large      3072 dimensions  → needs float16!
 
    float16 exactly doubles the ceiling:
      VECTOR(3072)            → error on float32 (exceeds 1,998)
@@ -802,15 +803,17 @@ GO
    The ANN plan shape is:
 
        Top
-        └─ Nested Loops (Inner Join)
-            ├─ Vector Index Seek     ← DiskANN graph walk, returns TOP_N node IDs
-            └─ Clustered Index Seek  ← PK lookup per result to fetch row data
+        └─ Nested Loops
+            ├─ Nested Loops
+            │   ├─ Vector Index Seek     ← DiskANN graph walk, returns TOP_N keys
+            │   └─ Clustered Index Seek  ← QuestionEmbeddings row lookup
+            └─ Clustered Index Seek      ← Posts row lookup
 
    Contrast with the exact kNN plan from Demo 01 Section 5 (no vector index):
 
-       Top (TopN Sort)
-        └─ Clustered Index Scan      ← full CI scan over every row
-            └─ Compute Scalar        ← VECTOR_DISTANCE computed for every row
+       Top N Sort
+        └─ Compute Scalar            ← VECTOR_DISTANCE computed for every row
+            └─ Clustered Index Scan  ← full CI scan over every row
 
    Section 2 has the measured page counts for both paths.
 
@@ -839,12 +842,12 @@ JOIN dbo.Posts p ON t.PostId = p.Id
 ORDER BY s.distance;
 GO
 
--- WHAT TO LOOK FOR in the graphical plan:
---   Node 0  Top              — enforces the 5-row limit
---   Node 1  Nested Loops     — for each ANN result, fetch the row
---   Node 2  Vector Index Seek — graph traversal: shows estimated/actual rows,
---                               index name 'vec_idx', and cost ~0.13 total
---   Node 3  Clustered Index Seek — PK lookup on QuestionEmbeddings.PostId
+-- WHAT TO LOOK FOR in the graphical plan (node numbers match the query below):
+--   Node 0   Top                  — enforces the 5-row limit
+--   Node 1-2 Nested Loops         — for each ANN result, fetch the rows
+--   Node 3   Vector Index Seek    — the graph walk on 'vec_idx', cost ~0.13
+--   Node 36  Clustered Index Seek — QuestionEmbeddings lookup
+--   Node 37  Clustered Index Seek — Posts lookup
 
 -- Query the plan cache directly to see the operator tree without SSMS:
 SET QUOTED_IDENTIFIER ON;
@@ -885,9 +888,9 @@ GO
    This is the most dangerous production pitfall with earlier-version DiskANN.
    It produces no error — just silently returns zero rows.
 
-   SETUP: find questions with Score > 5,000 that are semantically related to
-   CSS centering. There are 21 such questions in the 10,000-row embedded set
-   (0.21% selectivity). But if TOP_N is too small, none of the ANN candidates
+   SETUP: find questions about CSS centering with Score > 5,000. Only 21
+   questions in the 10,000-row embedded set have Score > 5,000 at all
+   (0.21% selectivity). If TOP_N is too small, none of the ANN candidates
    pass the filter.
 
    STEP 1: ANN with tight TOP_N=5 and a selective Score filter.
@@ -1051,7 +1054,7 @@ GO
    Filters applied AFTER graph walk             Iterative filtering: filters IN the walk
    Manual TOP_N oversampling needed             SELECT TOP (N) WITH APPROXIMATE
    No staleness DMV                             sys.dm_db_vector_indexes
-   ALLOW_STALE_VECTOR_INDEX workaround          No workaround needed
+   Drop-insert-rebuild cycle                    No workaround needed
    ============================================================================= */
 
 

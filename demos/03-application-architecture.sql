@@ -26,7 +26,7 @@ GO
 
   Run sections top-to-bottom. Every section is idempotent.
 
-  TIME BUDGET: 20 minutes of a 60-minute session.
+  TIME BUDGET: 20 of the 60 demo minutes (75-minute slot, 15 for Q&A).
     1   schema + chunking          4 min
     2   RAG procs                  5 min
     3   security                   3 min
@@ -67,8 +67,9 @@ GO
 
      INDEX REQUIREMENTS
        A vector index needs a clustered primary key on a single INT column
-       (Msg 42217 otherwise). Posts may not fit that rule. A satellite table
-       lets you design the key for the index.
+       (Msg 42217 otherwise). Posts happens to fit, but plenty of source tables
+       have GUID or composite keys. A satellite table lets you design the key
+       for the index.
 
      PARTIAL COVERAGE
        Not every Post needs an embedding. We embedded the top questions
@@ -227,8 +228,8 @@ GO
        receives text and numbers. It never needs to deserialize 768 floats.
 
      GOVERNANCE
-       EXECUTE permission on the proc is the only SQL Server grant the
-       application needs. Section 3 shows how narrow that grant really is.
+       The app gets EXECUTE on two procs and the model, plus metadata-only
+       VIEW DEFINITION on one table. No SELECT anywhere. Section 3 shows it.
 ----------------------------------------------------------------------------- */
 
 /* -----------------------------------------------------------------------------
@@ -395,8 +396,12 @@ GO
      - Read any table it is not explicitly granted on
      - INSERT, UPDATE, or DELETE anything
      - DROP or ALTER any object
-     - See the embedding model endpoint URL or credentials
+     - Read the proc source (OBJECT_DEFINITION returns NULL)
      - Access any database other than StackOverflow
+
+   One thing it CAN see: EXECUTE on the external model makes its row in
+   sys.external_models visible, including the endpoint URL. Keep secrets in
+   a database scoped credential, never in the LOCATION.
 ----------------------------------------------------------------------------- */
 
 USE [master];
@@ -482,6 +487,9 @@ GO
    Schedule this in a low-traffic window. Azure SQL Database, Fabric, and
    Managed Instance (Always-up-to-date) don't need it: their latest-version
    index supports DML and maintains itself in the background.
+
+   LIVE-DEMO TIP: step 3 rebuilds the index over ~10,000 rows, which takes
+   up to two minutes. Start it, then walk through the Section 5 diagram.
 ----------------------------------------------------------------------------- */
 
 USE [StackOverflow];

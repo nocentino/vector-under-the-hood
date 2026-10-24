@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SQL Server 2025 Vectors: Under the Hood and Into Production
-Demo 4 — Python RAG Application
+Demo 03 Section 5 — Python RAG Application
 
 Retrieval-Augmented Generation over the StackOverflow dataset.
 
@@ -298,7 +298,8 @@ def answer_question(user_question: str) -> None:
     t0 = time.perf_counter()
     print(f"\n[1/4] Searching SQL Server for top {TOP_K} similar questions…")
 
-    with get_connection() as conn:
+    conn = get_connection()
+    try:
         similar = find_similar_questions(conn, user_question, top=TOP_K)
 
         if not similar:
@@ -317,6 +318,8 @@ def answer_question(user_question: str) -> None:
         for q in similar:
             answer = get_top_answer(conn, q["post_id"])
             q["answer_body"] = answer["answer_body"] if answer else None
+    finally:
+        conn.close()   # pyodbc's context manager commits but doesn't close
 
     # ── Step 3: assemble prompt ───────────────────────────────────────────────
     print(f"\n[3/4] Assembling RAG prompt…")
@@ -370,6 +373,8 @@ def main() -> None:
                 print(f"\nError: {exc}\n")
             except pyodbc.Error as exc:
                 print(f"\nDatabase error: {exc}\n")
+            except requests.exceptions.RequestException as exc:
+                print(f"\nOllama error: {exc}\n")
 
 
 if __name__ == "__main__":

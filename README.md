@@ -70,7 +70,7 @@ batches of 100, then rebuilds the DiskANN index over all 10,000 rows.
 | Per 100 embeddings | ~20 sec |
 | Full 10,000-row run (90 additional batches) | ~30 minutes |
 | DiskANN index build, 1,000 rows | ~11 seconds |
-| DiskANN index build, 10,000 rows | ~23 seconds warm; 125–160 seconds after loading; ~340 seconds after a container restart |
+| DiskANN index build, 10,000 rows | ~23 seconds to ~2 minutes on a running instance; ~340 seconds right after a restart |
 
 The script is resumable — if interrupted, re-run it and it picks up where it
 left off (the `NOT EXISTS` guard skips already-embedded rows).
@@ -82,8 +82,10 @@ left off (the `NOT EXISTS` guard skips already-embedded rows).
 Everything runs much slower right after a restart. Warm it up first:
 
 1. Start Docker Desktop, then `./start.sh`, and wait for `sql1` to be healthy.
-2. Run one throwaway index build (Demo 02 §1b). A cold 10,000-row build took
-   ~340 seconds here; warm, it's ~23.
+2. Run one throwaway index build (Demo 02 §1b). The first build after a
+   restart took ~340 seconds here; after that, 23 seconds to 2 minutes.
+   The demos rebuild the index twice live (Demo 02 §1b, Demo 03 §4a), so
+   budget about two minutes for each and talk through a diagram while it runs.
 3. Run Demo 02 §2b once so the plans and buffer pool are warm.
 4. Ask the app one question so Ollama loads `llama3.2`:
    `docker compose run --rm rag-app python demos/rag-app.py "warm up"`

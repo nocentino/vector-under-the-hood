@@ -19,7 +19,7 @@
 # What this script does:
 #   1. Drops the DiskANN index (required for bulk INSERT on SQL Server 2025)
 #   2. Shell while loop: sends 100-row INSERT batches to SQL Server until
-#      dbo.QuestionEmbeddings has 10,000 rows. 100-row batches (~15 s each)
+#      dbo.QuestionEmbeddings has 10,000 rows. 100-row batches (~20 s each)
 #      stay well within SQL Server's external REST endpoint timeout, unlike
 #      1,000-row batches (~90–165 s) which hit Msg 31629 inconsistently.
 #   3. Rebuilds the DiskANN index over all 10,000 rows
@@ -30,7 +30,7 @@ set -euo pipefail
 SA_PASSWORD='S0methingS@Str0ng!'
 CONTAINER='sql1'
 TARGET=10000
-BATCH=100   # 100-row batches (~15 s each) reliably stay within the external REST timeout.
+BATCH=100   # 100-row batches (~20 s each) reliably stay within the external REST timeout.
             # 1,000-row batches (~90–165 s) hit Msg 31629 inconsistently.
 
 # ── Helper: run sqlcmd inside the container ───────────────────────────────────
@@ -105,12 +105,24 @@ SET NOCOUNT ON;
 SELECT CAST(COUNT(*) AS VARCHAR(10)) FROM dbo.QuestionEmbeddings;
 GO" 2>&1 || true)
 
+    prev_total=$total
     total=$(echo "$result" | grep -E '^\s*[0-9]+\s*$' | tail -1 | tr -d ' ' || true)
     total=${total:-0}
 
     if echo "$result" | grep -q "31629"; then
         echo "[$(date '+%H:%M:%S')] Batch $batch_num: REST timeout — retrying (rows still: ${total:-?})"
+        total=$prev_total
+    elif [ "$total" -le "$prev_total" ]; then
+        failures=$(( ${failures:-0} + 1 ))
+        echo "[$(date '+%H:%M:%S')] Batch $batch_num made no progress:"
+        echo "$result" | grep -E '^Msg|Error' | head -3
+        if [ "$failures" -ge 3 ]; then
+            echo "Giving up after 3 failed batches. Is Ollama running? Is the index dropped?"
+            exit 1
+        fi
+        total=$prev_total
     else
+        failures=0
         echo "[$(date '+%H:%M:%S')] Batch $batch_num done — rows now: $total"
     fi
 done

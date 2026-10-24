@@ -84,7 +84,7 @@ GO
 -- LOCATION is the NGINX TLS reverse proxy (model-web:443) that sits in
 -- front of host Ollama. SQL Server 2025 requires HTTPS for external calls.
 -- Point this object at a different Ollama model to change models without
--- touching any query in the demo files (see Demo 03 Section 4c).
+-- touching any query in the demo files (see Demo 03 Section 4b).
 IF NOT EXISTS (SELECT 1 FROM sys.external_models WHERE name = N'ollama')
 BEGIN
     PRINT 'Creating EXTERNAL MODEL ollama...';
@@ -171,35 +171,39 @@ GO
 -- the question title concatenated with its cleaned tag string — the text
 -- that the embedding model turns into a 768-dimensional vector.
 --
--- The NOT EXISTS guard makes this resumable: safe to kill and restart,
--- and a no-op once all 1,000 rows are present.
---
--- NOTE on SQL Server 2025 earlier-version DiskANN: the table is READ-ONLY
--- while a vector index exists. The index is created in Step 6 AFTER this
--- bulk INSERT, so Step 5 always runs against an unindexed table.
-PRINT 'Generating embeddings for top 1,000 questions (incremental)...';
+-- Every ./start.sh reruns this script, so this step only tops the table up
+-- to 1,000 rows, and only while there's no vector index (the table is
+-- READ-ONLY while one exists). After expand-embeddings.sh it does nothing.
+-- The INSERT is dynamic SQL because Msg 42231 fires at compile time, even
+-- inside an IF branch that never runs.
+PRINT 'Generating embeddings for top 1,000 questions (if needed)...';
 GO
 
-;WITH top_questions AS (
-    SELECT TOP (1000)
-        p.Id,
-        p.Title + N' ' +
-            REPLACE(REPLACE(REPLACE(ISNULL(p.Tags, N''), N'><', N' '), N'<', N''), N'>', N'')
-            AS chunk
-    FROM dbo.Posts p
-    WHERE p.PostTypeId = 1
-      AND p.Title      IS NOT NULL
-      AND NOT EXISTS (
-          SELECT 1 FROM dbo.QuestionEmbeddings qe WHERE qe.PostId = p.Id
-      )
-    ORDER BY p.Score DESC
-)
-INSERT INTO dbo.QuestionEmbeddings (PostId, chunk, embeddings)
-SELECT
-    q.Id,
-    q.chunk,
-    AI_GENERATE_EMBEDDINGS(q.chunk USE MODEL ollama) AS embeddings
-FROM top_questions q;
+DECLARE @need INT = 1000 - (SELECT COUNT(*) FROM dbo.QuestionEmbeddings);
+
+IF @need > 0
+   AND NOT EXISTS (SELECT 1 FROM sys.vector_indexes
+                   WHERE object_id = OBJECT_ID('dbo.QuestionEmbeddings'))
+    EXEC sp_executesql N'
+    INSERT INTO dbo.QuestionEmbeddings (PostId, chunk, embeddings)
+    SELECT
+        q.Id,
+        q.chunk,
+        AI_GENERATE_EMBEDDINGS(q.chunk USE MODEL ollama) AS embeddings
+    FROM (
+        SELECT TOP (@need)
+            p.Id,
+            p.Title + N'' '' +
+                REPLACE(REPLACE(REPLACE(ISNULL(p.Tags, N''''), N''><'', N'' ''), N''<'', N''''), N''>'', N'''')
+                AS chunk
+        FROM dbo.Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Title      IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM dbo.QuestionEmbeddings qe WHERE qe.PostId = p.Id
+          )
+        ORDER BY p.Score DESC
+    ) AS q;', N'@need INT', @need = @need;
 GO
 
 DECLARE @embedded INT = (SELECT COUNT(*) FROM dbo.QuestionEmbeddings);
@@ -383,7 +387,7 @@ USE [master];
 GO
 
 -- ── dba_monitor: read-only monitoring login ───────────────────────────────
--- Matches the faststart repo — grants VIEW SERVER STATE for DMV queries.
+-- Grants VIEW SERVER STATE for DMV queries.
 -- Included so Demo 02's index build monitoring queries run under this login.
 IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'dba_monitor')
     CREATE LOGIN dba_monitor
