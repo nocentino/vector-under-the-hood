@@ -4,6 +4,9 @@ Conference demo repo for the talk **"SQL Server 2025 Vectors: Under the Hood and
 Everything runs locally — SQL Server 2025, Ollama embeddings, and a Python RAG app —
 with a single command. No cloud services, no API keys.
 
+Tested on SQL Server 2025 CU10 (17.0.5035.5) in Docker on an Apple M2 (24 GB) with
+Ollama on the host. Every number quoted in the demo scripts was measured on that setup.
+
 ---
 
 ## What you need
@@ -40,21 +43,26 @@ cd vector-under-the-hood
    the database, generates 1,000 embeddings, and builds the DiskANN vector index
 
 The `sql-init` container runs the full setup and exits with code 0 when everything  
-is ready. Watch progress with:
+is ready, or non-zero if any step fails. Watch progress with:
 
 ```bash
 docker logs -f sql-init
+docker compose ps -a sql-init      # STATUS shows "Exited (0)" on success
 ```
 
 First run takes **10–20 minutes** (image pulls + embedding 1,000 questions).
 
+Re-running `./start.sh` is safe. `sql-init` runs again but only fills the table up to
+1,000 rows if it's short, so it never touches an expanded 10,000-row table.
+
 ---
 
-## Expanding the corpus to 10,000 embeddings (recommended)
+## Expanding the corpus to 10,000 embeddings (do this before presenting)
 
-The startup script embeds the **top 1,000** questions by community score. For a
-more striking ANN vs. kNN IO contrast (Demo 02 §2) and a larger recall sample
-(Demo 02 §3), expand to **10,000 rows** before running the demos:
+The startup script embeds the **top 1,000** questions by community score. The
+numbers in Demo 02 (IO comparison, scale table, the zero-results test in §4f)
+assume **10,000 rows**. At 1,000 rows the vector index actually loses to a full
+scan, so expand first:
 
 ```bash
 bash setup/expand-embeddings.sh
@@ -73,7 +81,9 @@ batches of 100, then rebuilds the DiskANN index over all 10,000 rows.
 | DiskANN index build, 10,000 rows | ~23 seconds to ~2 minutes on a running instance; ~340 seconds right after a restart |
 
 The script is resumable — if interrupted, re-run it and it picks up where it
-left off (the `NOT EXISTS` guard skips already-embedded rows).
+left off (the `NOT EXISTS` guard skips already-embedded rows). Batches that hit
+the REST timeout (Msg 31629) are retried; if three batches in a row make no
+progress, the script stops and prints the error (usually Ollama isn't running).
 
 ---
 
@@ -117,6 +127,11 @@ Everything runs much slower right after a restart. Warm it up first:
 | Monitor login | `dba_monitor` / `MonitorP@ss123!` |
 
 > Port **1435** is used (not 1433) to avoid conflicts with other local SQL Server instances.
+
+`rag_app` has no `SELECT` on any table. It gets `EXECUTE` on the two search procs
+and on `EXTERNAL MODEL::ollama`, plus `VIEW DEFINITION` on `dbo.QuestionEmbeddings`.
+That last grant is metadata only; without it the proc can't see the vector index
+in `sys.vector_indexes` and silently falls back to a full scan (Demo 03 §2a).
 
 ---
 
@@ -247,3 +262,31 @@ search path served each question.
 | `VECTOR_SEARCH` | 02 §2, 03 §2 |
 | `SELECT TOP N WITH APPROXIMATE`, `sys.dm_db_vector_indexes` | 02 §5 (Azure only, shown not run) |
 | `EXTERNAL MODEL` (Ollama via HTTPS) | 01 §3, 03 |
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Msg 31629 "external rest endpoint execution exceeded the timeout" | The Ollama model is cold or Ollama isn't running. Warm it with a `curl` to `/api/embed` (see *Before you present*) and retry. |
+| Msg 42231 / 42232 on INSERT, UPDATE, DELETE, or TRUNCATE | Expected on SQL Server 2025: the table is read-only while a vector index exists. Drop the index, load, rebuild (Demo 03 §4a). |
+| Msg 42227 "Cannot find a vector index" | `VECTOR_SEARCH` needs an index on SQL Server 2025, and `CREATE PROCEDURE` with `VECTOR_SEARCH` fails if the index doesn't exist yet. Rebuild the index first. |
+| The app always reports `kNN` | `rag_app` is missing `VIEW DEFINITION` on `dbo.QuestionEmbeddings`, or the index is dropped. |
+| `sql-init` exited non-zero | Read `docker logs sql-init`. Usually Ollama isn't reachable from the container (`OLLAMA_HOST=0.0.0.0`). |
+| SSMS: "'Vector Index Seek' is not a valid value for PhysicalOpType" | Your SSMS predates the operator. Update SSMS, or use the plan cache query in Demo 02 §4e. |
+| Host Python: "OpenSSL library could not be loaded" | Run the app in the `rag-app` container instead (see *Python RAG app*). |
+| Everything is slow right after Docker restarts | Expected. Follow *Before you present* to warm up. |
+
+---
+
+## Repo layout
+
+```
+demos/        01-03 demo scripts, rag-app.py (CLI), rag-app-ui.py (Streamlit)
+setup/        init.sql (run by sql-init), expand-embeddings.sh
+config/       nginx.conf for the TLS proxy
+certs/        generate_ssl.sh; the cert and key are generated on first start
+backups/      StackOverflowMini.bak (downloaded by start.sh, git-ignored)
+docker-compose.yml, dockerfile.ssl, dockerfile.app, start.sh, stop.sh
+```
