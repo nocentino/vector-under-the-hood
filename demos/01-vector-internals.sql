@@ -6,17 +6,18 @@ GO
 =============================================================================
   SQL Server 2025 Vectors: Under the Hood and Into Production
 
-  Demo 1 of 3 — VECTOR DATA TYPE INTERNALS
+  Demo 1 of 3: VECTOR DATA TYPE INTERNALS
   Storage layout  ·  Catalog views  ·  Query execution
 =============================================================================
 
   Learning objective:
-    Describe vector data type internals: storage, indexing, and query execution.
+    You'll be able to describe vector internals: storage, indexing, and
+    query execution.
 
   Prerequisites:
-    Stack is up (./start.sh), StackOverflow is restored and embedded.
+    The stack is up (./start.sh) and StackOverflow is restored and embedded.
     The sql-init container ran setup/init.sql at startup, which embeds
-    1,000 rows. Run setup/expand-embeddings.sh to grow to 10,000 rows
+    1,000 rows. Run setup/expand-embeddings.sh to grow it to 10,000 rows
     (recommended; Demo 02's scale numbers assume 10,000).
 
   Connect:
@@ -24,7 +25,7 @@ GO
     Login:    sa
     Password: S0methingS@Str0ng!   (demo only)
 
-  Run sections top-to-bottom. Every section is idempotent.
+  Run the sections top to bottom. Every one is idempotent.
 
   TIME BUDGET: 15 of the 60 demo minutes (75-minute slot, 15 for Q&A).
     1a-1c  storage and catalog       5 min
@@ -41,14 +42,15 @@ GO
 
 
 /* =============================================================================
-   SECTION 1 — THE VECTOR DATA TYPE: WHAT IT IS AT THE BINARY LEVEL
+   SECTION 1: THE VECTOR DATA TYPE, WHAT IT IS AT THE BINARY LEVEL
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
    1a. VECTOR in the type catalog
    -----------------------------------------------------------------------------
-   VECTOR is a first-class type in SQL Server 2025. It appears in sys.types
-   just like INT, NVARCHAR, or DATETIME2. Two max_length values to know:
+   VECTOR is a first-class type in SQL Server 2025. It shows up in sys.types
+   just like INT, NVARCHAR, or DATETIME2. There are two max_length values you
+   need to know:
 
    sys.types:    max_length = 8000  (type-level maximum for any VECTOR column)
    sys.columns:  max_length = 8 + dimensions × element_bytes
@@ -61,26 +63,26 @@ GO
      float32:  (8000 - 8) / 4 = 1,998 dimensions max
      float16:  (8000 - 8) / 2 = 3,996 dimensions max
 
-   We use 768 because that is the output dimension of our embedding model:
-   nomic-embed-text (https://ollama.com/library/nomic-embed-text). The
-   dimension count is a property of the model, not a choice — every model
-   produces a fixed-width vector and your VECTOR column must match it exactly.
+   We're using 768 because that's what our embedding model outputs:
+   nomic-embed-text (https://ollama.com/library/nomic-embed-text). You don't
+   pick the dimension count. The model does. Every model produces a
+   fixed-width vector, and your VECTOR column has to match it exactly.
    Common sizes: 384 (MiniLM), 768 (nomic-embed-text, BGE), 1,536 (OpenAI
    text-embedding-ada-002), 3,072 (text-embedding-3-large).
 
-   The 8-byte prefix is a binary metadata header SQL Server prepends to every
-   stored VECTOR value. DATALENGTH() and sys.columns.max_length both include it.
-   Use sys.columns.vector_dimensions for the authoritative dimension count.
+   That 8-byte prefix is a binary metadata header SQL Server puts in front of
+   every stored VECTOR value. DATALENGTH() and sys.columns.max_length both
+   include it. For the real dimension count, use sys.columns.vector_dimensions.
 
-   What's documented and what's observed: the docs say each element is a
-   4-byte float and give the 1,998 / 3,996 limits. The 8-byte header isn't
-   documented. You see it here with DATALENGTH and sys.columns, so treat it
-   as an implementation detail that could change.
+   Here's what's documented versus what I observed. The docs say each element
+   is a 4-byte float and give the 1,998 / 3,996 limits. The 8-byte header
+   isn't documented. You can see it here with DATALENGTH and sys.columns, so
+   treat it as an implementation detail that could change.
      https://learn.microsoft.com/en-us/sql/t-sql/data-types/vector-data-type
 
-   This is the foundation of everything that follows: the type is not text,
-   not JSON, not a blob you manage yourself. It's a native numeric array with
-   a known, fixed stride.
+   Everything else in this demo builds on this. The type isn't text, isn't
+   JSON, and isn't a blob you manage yourself. It's a native numeric array
+   with a known, fixed stride.
 ----------------------------------------------------------------------------- */
 
 SELECT
@@ -108,25 +110,24 @@ GO
 
 
 /* -----------------------------------------------------------------------------
-   1b. Storage size in practice — DATALENGTH
+   1b. Storage size in practice: DATALENGTH
    -----------------------------------------------------------------------------
    DATALENGTH() returns the actual bytes stored for a value. For a VECTOR(768):
 
        8-byte header + 768 dimensions × 4 bytes = 3,080 bytes
 
-   The VECTOR binary format includes an 8-byte metadata header before the
-   element payload. So DATALENGTH returns 3,080, not 3,072. To recover the
-   dimension count from raw bytes, subtract the header first:
+   The 8-byte header sits in front of the element payload, so DATALENGTH
+   returns 3,080, not 3,072. To get the dimension count back from raw bytes,
+   subtract the header first:
        (DATALENGTH(col) - 8) / 4  → 768
 
-   Compare that to the JSON text representation (what you see when you SELECT
-   the column). SQL Server writes each float in scientific notation, like
-   4.3272693e-002, so 768 of them come to about 12,000 characters. As
-   NVARCHAR that's ~24,000 bytes, nearly 8× the binary size, with no type
-   enforcement.
+   Now compare that to the JSON text you see when you SELECT the column.
+   SQL Server writes each float in scientific notation, like 4.3272693e-002,
+   so 768 of them come to about 12,000 characters. As NVARCHAR that's
+   ~24,000 bytes. Nearly 8× the binary size, with no type enforcement.
 
-   Prefer sys.columns.vector_dimensions (see §1a) over the DATALENGTH arithmetic
-   — it's cleaner and correct for both float32 and float16 columns.
+   I'd use sys.columns.vector_dimensions (see §1a) over the DATALENGTH math.
+   It's cleaner, and it's correct for both float32 and float16 columns.
 ----------------------------------------------------------------------------- */
 
 SELECT TOP (1)
@@ -138,8 +139,8 @@ SELECT TOP (1)
 FROM dbo.QuestionEmbeddings qe;
 GO
 
--- Quick sanity check: are all stored vectors the same dimension?
--- Mismatched dimensions would indicate a pipeline bug or a mid-flight model swap.
+-- Quick sanity check: are all the stored vectors the same dimension?
+-- If they're not, you've got a pipeline bug or a model swap mid-flight.
 SELECT
     (DATALENGTH(embeddings) - 8) / 4  AS dimension_count,
     COUNT(*)                          AS row_count
@@ -149,22 +150,22 @@ GO
 
 
 /* -----------------------------------------------------------------------------
-   1c. Binary storage — client representation vs internal format
+   1c. Binary storage: client representation vs internal format
    -----------------------------------------------------------------------------
-   SQL Server stores VECTOR internally as a compact binary (8-byte header +
-   element payload). However, that raw binary is NOT accessible via CAST:
+   Internally, SQL Server stores VECTOR as compact binary (8-byte header +
+   element payload). But you can't get at that raw binary with CAST:
 
        CAST(col AS VARBINARY(MAX))  →  Msg 529, conversion not allowed.
 
-   The only supported client-facing representations are:
-     • NVARCHAR / VARCHAR  — JSON array format: [1.0, -0.5, 0.123, ...]
-     • JSON               — same JSON array via JSON_VALUE / FOR JSON
+   Here's what clients can actually work with:
+     • NVARCHAR / VARCHAR : a JSON array, like [1.0, -0.5, 0.123, ...]
+     • JSON               : same JSON array via JSON_VALUE / FOR JSON
 
-   SQL Server converts to/from the JSON surface format on the way in and out.
-   The compact binary is an internal implementation detail.
+   SQL Server converts to and from JSON on the way in and out. The compact
+   binary is an internal implementation detail.
 
-   Roundtrip test: NVARCHAR → VECTOR → NVARCHAR produces the same values,
-   confirming that JSON is the interchange format and is lossless.
+   Let's roundtrip it: NVARCHAR → VECTOR → NVARCHAR gives back the same
+   values. JSON is the interchange format, and it's lossless.
 ----------------------------------------------------------------------------- */
 
 -- What the client sees: the first 80 characters of the JSON array:
@@ -173,7 +174,7 @@ SELECT TOP (1)
 FROM dbo.QuestionEmbeddings qe;
 GO
 
--- Roundtrip: text → VECTOR → text.  Proves JSON is just an interchange format.
+-- Roundtrip: text → VECTOR → text. JSON is just the interchange format.
 SELECT TOP (1)
     LEFT(CAST(
         CAST(CAST(qe.embeddings AS NVARCHAR(MAX)) AS VECTOR(768))
@@ -203,7 +204,7 @@ GO
    pages partly empty. A vector would only overflow if chunk grew past
    roughly 4,900 bytes.
 
-   Why you care: every kNN scan reads every page. At ~1.5 rows per page a
+   Why should you care? Every kNN scan reads every page. At ~1.5 rows per page a
    full scan of 10,000 rows reads ~6,700 pages. That's the number you'll see
    in STATISTICS IO in Section 5 and in Demo 02.
 ----------------------------------------------------------------------------- */
@@ -243,13 +244,13 @@ GO
 
 
 /* =============================================================================
-   SECTION 1e — HALF-PRECISION VECTORS: VECTOR(n, float16)
+   SECTION 1e: HALF-PRECISION VECTORS, VECTOR(n, float16)
    =============================================================================
 
-   SQL Server 2025 introduces an optional base type parameter for the VECTOR
-   type. The default is float32 (32-bit IEEE 754 single-precision, 4 bytes per
-   element). You can also specify float16 (16-bit half-precision, 2 bytes per
-   element).
+   SQL Server 2025 adds an optional base type parameter to VECTOR. The
+   default is float32 (32-bit IEEE 754 single-precision, 4 bytes per
+   element). You can also ask for float16 (16-bit half-precision, 2 bytes
+   per element).
 
    Syntax:
        VECTOR( <dimensions> [, <base_type>] )
@@ -262,20 +263,20 @@ GO
 
    At one million embeddings:
      float32  ~3 GB of raw vector data
-     float16  ~1.5 GB — fits in half the space, reads faster from disk
+     float16  ~1.5 GB (half the space, faster reads from disk)
 
    float16 also DOUBLES the dimension ceiling:
      float32  max 1,998 dimensions
      float16  max 3,996 dimensions
-   This unlocks larger models like text-embedding-3-large (3,072 dims).
+   That opens the door to bigger models like text-embedding-3-large (3,072 dims).
 
-   The trade-off: float16 has reduced numerical precision. The representable
-   range is ±65,504 (vs. ±3.4×10³⁸ for float32). For semantic similarity
-   search this is almost always acceptable — embeddings are unit-normalized,
-   so all values are in [−1, +1], well within float16 range.
+   The trade-off is precision. float16's range is ±65,504 (vs. ±3.4×10³⁸ for
+   float32). For semantic similarity search that's almost always fine.
+   Embeddings are unit-normalized, so every value is in [−1, +1], well
+   inside float16's range.
 
-   PLATFORM NOTE: float16 is a PREVIEW feature in SQL Server 2025. Enable
-   PREVIEW_FEATURES first (already on from the DiskANN setup in init.sql).
+   PLATFORM NOTE: float16 is a PREVIEW feature in SQL Server 2025. You need
+   PREVIEW_FEATURES on first (it already is, from the DiskANN setup in init.sql).
 ----------------------------------------------------------------------------- */
 
 -- 1e-1. Confirm PREVIEW_FEATURES is already on (required for float16):
@@ -305,15 +306,15 @@ GO
 -- Payload is exactly half; the 8-byte header is the same for both types.
 
 -- 1e-3. [OPTIONAL] The new sys.columns metadata columns for float16:
---   vector_dimensions     — dimension count (same as max_length / element_size)
---   vector_base_type      — 0 = float32, 1 = float16
---   vector_base_type_desc — 'float32' or 'float16'
+--   vector_dimensions     : dimension count (same as max_length / element_size)
+--   vector_base_type      : 0 = float32, 1 = float16
+--   vector_base_type_desc : 'float32' or 'float16'
 --
--- These columns only exist in SQL Server 2025. Older catalog queries using
--- max_length / 4 to infer dimensions will be incorrect for float16 columns
--- (where the stride is 2, not 4). Use vector_dimensions directly.
+-- These columns only exist in SQL Server 2025. If you've got older catalog
+-- queries doing max_length / 4 to infer dimensions, they're wrong for
+-- float16 columns (the stride is 2, not 4). Use vector_dimensions directly.
 
--- First create a small demo table with both types side by side:
+-- Let's create a small demo table with both types side by side:
 DROP TABLE IF EXISTS #vec_type_demo;
 CREATE TABLE #vec_type_demo
 (
@@ -347,8 +348,8 @@ WHERE c.object_id = OBJECT_ID('dbo.QuestionEmbeddings')
   AND c.vector_base_type_desc IS NOT NULL;
 GO
 
--- 1e-5. Arithmetic with float16 — distance functions work identically.
---       The API is the same; the storage format is the only difference.
+-- 1e-5. Arithmetic with float16: distance functions work the same way.
+--       Same API. Only the storage format changes.
 DECLARE @q32 VECTOR(3)          = '[0.1, 0.2, 0.3]';   -- float32 (default)
 DECLARE @q16 VECTOR(3, float16) = '[0.1, 0.2, 0.3]';   -- float16
 
@@ -359,7 +360,7 @@ SELECT
     DATALENGTH(@q16)                         AS f16_bytes;           -- 14 (8 header + 3 × 2)
 GO
 
--- 1e-6. KEY LIMITATIONS to be aware of:
+-- 1e-6. KEY LIMITATIONS you'll hit:
 --
 --   NO cross-type arithmetic:
 --     VECTOR_DISTANCE(float32_col, float16_col) → Msg 42243 (type mismatch)
@@ -367,19 +368,19 @@ GO
 --
 --   NO implicit float32 ↔ float16 conversion:
 --     CAST(@float32_var AS VECTOR(n, float16)) → Msg 42238
---     You must re-embed with the new type, not cast.
+--     You have to re-embed with the new type. You can't cast.
 --
 --   float16 range is ±65,504:
 --     Values outside this range (e.g., 70000.0) raise Msg 42241 at insert time.
 --     Unit-normalized embeddings (all values in [−1, +1]) are always safe.
 --
 --   TDS transport: ODBC 18.7.1+ and JDBC 13.4+ send float16 in binary.
---     Older drivers get varchar(max) JSON, which costs more on the wire.
+--     Older drivers get varchar(max) JSON, and that costs more on the wire.
 --
 --   ARM64: the docs say Arm64 architectures don't support float16.
 --
 
--- Demonstrate the cross-type error (catches the error, prints the message):
+-- Here's the cross-type error (we catch it and print the message):
 BEGIN TRY
     DECLARE @v32 VECTOR(3)          = '[1.0, 0.0, 0.0]';
     DECLARE @v16 VECTOR(3, float16) = '[1.0, 0.0, 0.0]';
@@ -387,25 +388,25 @@ BEGIN TRY
 END TRY
 BEGIN CATCH
     PRINT 'Error ' + CAST(ERROR_NUMBER() AS NVARCHAR(10)) + ': ' + ERROR_MESSAGE();
-    PRINT '=> Mixed base types in VECTOR_DISTANCE are not supported.';
+    PRINT '=> You can''t mix base types in VECTOR_DISTANCE.';
 END CATCH;
 GO
 
--- Demonstrate the out-of-range error:
+-- And here's the out-of-range error:
 BEGIN TRY
     DECLARE @overflow VECTOR(3, float16) = '[1.0, 2.0, 70000.0]';
     SELECT @overflow;
 END TRY
 BEGIN CATCH
     PRINT 'Error ' + CAST(ERROR_NUMBER() AS NVARCHAR(10)) + ': ' + ERROR_MESSAGE();
-    PRINT '=> float16 max representable value is 65,504. Unit-norm embeddings are safe.';
+    PRINT '=> float16 tops out at 65,504. Unit-norm embeddings are safe.';
 END CATCH;
 GO
 
 -- 1e-7. WHEN TO USE float16 vs float32
 --
 --   USE float16 WHEN:
---     - You need to store millions of embeddings and storage cost matters
+--     - You're storing millions of embeddings and storage cost matters
 --     - Your embedding model produces unit-normalized values (all values ≤ 1)
 --     - You need dimensions > 1,998 (e.g., text-embedding-3-large at 3,072 dims)
 --     - Approximate similarity search (RAG retrieval) is the workload
@@ -433,29 +434,29 @@ GO
 
 
 /* =============================================================================
-   SECTION 2 — [OPTIONAL] PHYSICAL STORAGE: FILEGROUPS AND DATA FILES
+   SECTION 2: [OPTIONAL] PHYSICAL STORAGE, FILEGROUPS AND DATA FILES
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
-   The QuestionEmbeddings table lives on a dedicated EMBEDDINGS filegroup backed
-   by StackOverflow_Embeddings.ndf — separate from the operational data (.mdf)
-   and log (.ldf).
+   QuestionEmbeddings lives on its own EMBEDDINGS filegroup, backed by
+   StackOverflow_Embeddings.ndf. That's separate from the operational data
+   (.mdf) and the log (.ldf).
 
-   Why separate the vectors onto their own filegroup?
+   Why put the vectors on their own filegroup?
 
      OPERATIONAL ISOLATION
-       Vector data and transactional data have different I/O profiles. Vectors
-       are large, sequential-read (during index build and full scans). OLTP data
-       is small, random-read. Mixing them on the same file can cause I/O contention.
+       Vectors and transactional data have different I/O profiles. Vectors
+       are large and read sequentially (index builds, full scans). OLTP data
+       is small and read randomly. Put them on the same file and they fight.
 
      INDEPENDENT MANAGEMENT
-       You can back up, restore, or OFFLINE the EMBEDDINGS filegroup independently.
-       If you need to rebuild all embeddings from scratch, you drop and recreate
-       the .ndf without touching the primary filegroup.
+       You can back up, restore, or OFFLINE the EMBEDDINGS filegroup on its own.
+       Need to rebuild every embedding from scratch? Drop and recreate the
+       .ndf without touching the primary filegroup.
 
      STORAGE TIERING
-       Point the EMBEDDINGS filegroup at a high-capacity SSD and the PRIMARY
-       filegroup at NVMe. Right-size each independently.
+       Point the EMBEDDINGS filegroup at a high-capacity SSD and PRIMARY at
+       NVMe. Size each one independently.
 ----------------------------------------------------------------------------- */
 
 -- All data files in the StackOverflow database:
@@ -493,18 +494,18 @@ GO
 
 
 /* =============================================================================
-   SECTION 3 — AI_GENERATE_EMBEDDINGS: WHAT HAPPENS AT EXECUTION TIME
+   SECTION 3: AI_GENERATE_EMBEDDINGS, WHAT HAPPENS AT EXECUTION TIME
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
    3a. The EXTERNAL MODEL catalog
    -----------------------------------------------------------------------------
    CREATE EXTERNAL MODEL registers a named pointer to an embedding endpoint.
-   It's an implementation detail: swap the model without changing any queries.
-   sys.external_models exposes the registration metadata.
+   Your queries use the name, so you can swap the model without touching
+   them. sys.external_models shows you the registration metadata.
 
-   The LOCATION is HTTPS because SQL Server 2025 requires TLS for external
-   calls. In this stack, NGINX terminates TLS in front of host Ollama.
+   Notice the LOCATION is HTTPS. SQL Server 2025 requires TLS for external
+   calls, so in this stack NGINX terminates TLS in front of Ollama on the host.
 ----------------------------------------------------------------------------- */
 
 SELECT
@@ -515,7 +516,7 @@ SELECT
 FROM sys.external_models em;
 GO
 
--- The server-level config switch that permits outbound REST calls:
+-- The server-level switch that allows outbound REST calls:
 EXEC sp_configure 'external rest endpoint enabled';
 GO
 
@@ -523,15 +524,15 @@ GO
 /* -----------------------------------------------------------------------------
    3b. What AI_GENERATE_EMBEDDINGS does at execution time
    -----------------------------------------------------------------------------
-   Each call to AI_GENERATE_EMBEDDINGS:
+   Here's what each call to AI_GENERATE_EMBEDDINGS does:
 
      1. Serializes the input text as a JSON payload
      2. Makes an HTTPS POST to the EXTERNAL MODEL's LOCATION endpoint
      3. Reads the response, extracts the float array from the JSON
      4. Returns a native VECTOR value
 
-   The call latency is dominated by the embedding service (Ollama on the host),
-   not by SQL compute. Measure it:
+   Most of the latency is the embedding service (Ollama on the host), not
+   SQL compute. Let's measure it:
 ----------------------------------------------------------------------------- */
 
 -- Single embedding latency:
@@ -543,7 +544,7 @@ GO
 SET STATISTICS TIME OFF;
 GO
 
--- 10 rows batched — compare elapsed time to single-call latency above:
+-- 10 rows batched. Compare the elapsed time to the single call above:
 SET STATISTICS TIME ON;
 GO
 SELECT TOP (10)
@@ -559,7 +560,7 @@ GO
 
 
 /* =============================================================================
-   SECTION 4 — DISTANCE METRICS: COSINE, EUCLIDEAN, DOT PRODUCT
+   SECTION 4: DISTANCE METRICS, COSINE, EUCLIDEAN, DOT PRODUCT
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
@@ -571,14 +572,14 @@ GO
      'dot'       -(v1 · v2)                      inner product, negated
 
    For text embeddings:
-     - Cosine is the standard choice. It treats a short and a long passage
-       about the same topic as equally close (magnitude is irrelevant).
-     - Euclidean is sensitive to vector length — avoid for text unless you
+     - Cosine is the standard choice. A short and a long passage on the same
+       topic come out equally close, because magnitude doesn't matter.
+     - Euclidean cares about vector length. Skip it for text unless you
        normalize the vectors first.
-     - Dot product is equivalent to cosine when vectors are unit-normalized
-       (which most embedding models produce). It's slightly cheaper to compute.
+     - Dot product matches cosine when vectors are unit-normalized (most
+       embedding models produce those). It's a bit cheaper to compute.
 
-   Range for cosine distance on real text embeddings: roughly 0.1 (very similar)
+   On real text embeddings, cosine distance runs roughly 0.1 (very similar)
    to 0.6 (unrelated). Below ~0.3 is usually a strong semantic match.
 ----------------------------------------------------------------------------- */
 
@@ -595,10 +596,10 @@ GO
 -- VECTOR_NORM computes the magnitude of a vector using the specified norm.
 -- Syntax: VECTOR_NORM(vector, norm_type)
 -- Supported norm_type values:
---   'norm1'   — L1 norm: sum of absolute values          e.g. |3|+|4|+|0| = 7.0
---   'norm2'   — L2 Euclidean norm: √(Σ xᵢ²)              e.g. √(9+16+0)   = 5.0
---   'norminf' — Infinity norm: max of absolute values    e.g. max(3,4,0)  = 4.0
--- For unit-normalized embeddings, norm2 should be very close to 1.0.
+--   'norm1'   : L1 norm: sum of absolute values          e.g. |3|+|4|+|0| = 7.0
+--   'norm2'   : L2 Euclidean norm: √(Σ xᵢ²)              e.g. √(9+16+0)   = 5.0
+--   'norminf' : Infinity norm: max of absolute values    e.g. max(3,4,0)  = 4.0
+-- For unit-normalized embeddings, norm2 should come out very close to 1.0.
 DECLARE @v VECTOR(3) = '[3.0, 4.0, 0.0]';
 SELECT
     VECTOR_NORM(@v, 'norm1')   AS l1_norm,    -- 7.0
@@ -606,8 +607,8 @@ SELECT
     VECTOR_NORM(@v, 'norminf') AS inf_norm;   -- 4.0
 GO
 
--- Are our stored embeddings unit-normalized?
--- Most embedding models (including nomic-embed-text) produce unit vectors.
+-- Are our stored embeddings unit-normalized? They should be.
+-- Most embedding models, nomic-embed-text included, produce unit vectors.
 SELECT
     MIN(CAST(VECTOR_NORM(embeddings, 'norm2') AS FLOAT))  AS min_norm,
     MAX(CAST(VECTOR_NORM(embeddings, 'norm2') AS FLOAT))  AS max_norm,
@@ -617,22 +618,22 @@ GO
 
 
 /* =============================================================================
-   SECTION 5 — QUERY EXECUTION: EXACT kNN (THE TABLE SCAN PATH)
+   SECTION 5: QUERY EXECUTION, EXACT kNN (THE TABLE SCAN PATH)
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
-   5a. The exact kNN query — and what SQL Server does to answer it
+   5a. The exact kNN query, and what SQL Server does to answer it
    -----------------------------------------------------------------------------
-   Without a vector index, finding the K nearest neighbors requires:
+   Without a vector index, here's what it takes to find the K nearest neighbors:
 
      1. Embed the query text                     (one HTTP call to Ollama)
      2. Scan EVERY row in QuestionEmbeddings     (O(n) reads)
      3. Compute VECTOR_DISTANCE for every row    (O(n) float arithmetic)
      4. Keep the K smallest distances            (Top N Sort, O(n log K))
 
-   This is called an exhaustive or brute-force kNN search. It guarantees
-   exact (perfect-recall) results. It's fine for tens of thousands of rows.
-   It doesn't scale to millions.
+   That's an exhaustive, or brute-force, kNN search. The results are exact
+   (perfect recall). It's fine for tens of thousands of rows. It doesn't
+   scale to millions.
 
    One query-shape tip: rank inside the satellite table first, then join to
    Posts for the 10 winners. If you join first, the optimizer can join every
@@ -640,9 +641,9 @@ GO
    Posts, against 40 for rank-then-join. The CTE below keeps the join to
    10 rows.
 
-   SET STATISTICS IO and TIME show exactly what it cost.
-   After running this, look at the logical reads in the Messages tab —
-   that number is the cost of a full scan of the embeddings table.
+   SET STATISTICS IO and TIME show you exactly what it cost. After you run
+   it, check the logical reads in the Messages tab. That number is the cost
+   of a full scan of the embeddings table.
 ----------------------------------------------------------------------------- */
 
 SET STATISTICS IO ON;
@@ -676,7 +677,7 @@ GO
 /* -----------------------------------------------------------------------------
    5b. The execution plan for exact kNN
    -----------------------------------------------------------------------------
-   Enable INCLUDE ACTUAL EXECUTION PLAN in SSMS (Ctrl+M), then re-run the
+   Turn on INCLUDE ACTUAL EXECUTION PLAN in SSMS (Ctrl+M) and re-run the
    query above. You'll see this operator chain:
 
      [Clustered Index Scan]  →  [Compute Scalar]  →  [Top N Sort]
@@ -685,21 +686,21 @@ GO
    On a multi-core box you may also see Parallelism operators around the
    scan.
 
-   Operator by operator:
+   Let's walk through it operator by operator:
 
      Clustered Index Scan
        Reads every row from QuestionEmbeddings. No predicate can filter rows
-       before the distance is computed — you must read the vector to know the
-       distance. This is the fundamental cost of exact kNN.
+       before the distance is computed. You have to read the vector to know
+       the distance. That's the fundamental cost of exact kNN.
 
      Compute Scalar
        Calls VECTOR_DISTANCE(cosine, @query_vector, qe.embeddings) for each row.
-       This is float arithmetic over 768 values per row.
+       That's float arithmetic over 768 values per row.
 
      Top N Sort
        Keeps only the K closest candidates seen so far. It holds K rows in
-       memory, but it must read ALL n rows before it can be certain it has
-       the right K.
+       memory, but it has to read ALL n rows before it knows it has the
+       right K.
 
      Nested Loops + Clustered Index Seek on Posts
        Fetches titles for the 10 winners.
@@ -708,7 +709,7 @@ GO
    graph walk. Demo 2 measures when that pays off and when it doesn't.
 ----------------------------------------------------------------------------- */
 
--- Capture plan as XML for offline analysis:
+-- Capture the plan as XML so you can dig into it later:
 SET STATISTICS XML ON;
 GO
 DECLARE @query_text   NVARCHAR(MAX) = N'how do I undo my last git commit?';
@@ -731,11 +732,11 @@ GO
 
 
 /* -----------------------------------------------------------------------------
-   5c. [OPTIONAL] Cosine distance in practice — strong match vs. weak match
+   5c. [OPTIONAL] Cosine distance in practice: strong match vs. weak match
    -----------------------------------------------------------------------------
-   Concrete numbers help you understand what "distance" means.
-   A distance near 0.1 is a very strong match; near 0.5 is background noise.
-   These thresholds are model-dependent but consistent within a model.
+   Real numbers make "distance" easier to reason about. Near 0.1 is a very
+   strong match. Near 0.5 is background noise. The thresholds depend on the
+   model, but they're consistent within a model.
 ----------------------------------------------------------------------------- */
 
 DECLARE @question     VECTOR(768) = AI_GENERATE_EMBEDDINGS(
@@ -752,8 +753,8 @@ SELECT
     VECTOR_DISTANCE('cosine', @question, @weak_match)   AS weak_match_distance;
 GO
 
--- See how the real StackOverflow questions cluster around the query —
--- the top results are tight; then there is a natural gap before the noise:
+-- Now look at how real StackOverflow questions cluster around the query.
+-- The top results are tight, then there's a natural gap before the noise:
 DECLARE @query_vector VECTOR(768) = AI_GENERATE_EMBEDDINGS(
     N'how do I undo my last git commit?' USE MODEL ollama);
 
@@ -765,7 +766,7 @@ FROM dbo.QuestionEmbeddings qe
 JOIN dbo.Posts p ON qe.PostId = p.Id
 ORDER BY distance;
 GO
--- Notice the score drop-off: top results are in the 0.1–0.3 range.
--- Results above ~0.4 are usually semantically unrelated to the query.
--- Choosing a distance threshold (instead of TOP K) is an alternative strategy —
--- but TOP K is simpler and tends to be more robust in practice.
+-- Notice the drop-off: the top results are in the 0.1–0.3 range.
+-- Anything above ~0.4 is usually unrelated to the query.
+-- You could use a distance threshold instead of TOP K, but in practice
+-- TOP K is simpler and holds up better.

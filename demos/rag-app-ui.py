@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SQL Server 2025 Vectors: Under the Hood and Into Production
-Demo — RAG Application Web UI
+Demo: RAG Application Web UI
 
 Run:
     streamlit run demos/rag-app-ui.py
@@ -10,19 +10,19 @@ Architecture (same as rag-app.py, wrapped in a Streamlit chat interface):
     User question
         │
         ▼
-    SQL Server 2025 — dbo.find_similar_questions
+    SQL Server 2025: dbo.find_similar_questions
         ├── AI_GENERATE_EMBEDDINGS  (SQL Server → Ollama)
         ├── VECTOR_SEARCH (DiskANN), exact kNN while the index is rebuilt
         └── TOP K results
         │
         ▼
-    SQL Server 2025 — dbo.get_top_answer (per result)
+    SQL Server 2025: dbo.get_top_answer (per result)
         │
         ▼
     RAG prompt assembly
         │
         ▼
-    Ollama LLM (llama3.2) — direct HTTP from Python
+    Ollama LLM (llama3.2): direct HTTP from Python
         │
         ▼
     Streamlit chat UI
@@ -52,7 +52,7 @@ LLM_MODEL       = "llama3.2"   # must be pulled: `ollama pull llama3.2`
 
 TOP_K            = 5
 MAX_ANSWER_CHARS = 800
-REQUEST_TIMEOUT  = 300         # generous — llama3.2 on CPU can be slow
+REQUEST_TIMEOUT  = 300         # generous, since llama3.2 on CPU can be slow
 
 
 # ─── HTML helper ──────────────────────────────────────────────────────────────
@@ -83,7 +83,7 @@ def strip_html(raw: str) -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_connection() -> pyodbc.Connection:
-    """Open and cache a single connection for the lifetime of the Streamlit app."""
+    """Opens one connection and caches it for as long as the Streamlit app runs."""
     for driver in ("ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server"):
         if driver in pyodbc.drivers():
             break
@@ -137,7 +137,8 @@ def get_top_answer(question_post_id: int) -> Optional[dict]:
 def stream_ollama(prompt: str, model: str = LLM_MODEL):
     """
     Generator that yields text chunks from Ollama's streaming /api/generate.
-    Streaming updates the Streamlit UI token-by-token instead of one long wait.
+    With streaming, the Streamlit UI updates token by token so you're not
+    staring at one long wait.
     """
     try:
         with requests.post(
@@ -220,11 +221,11 @@ st.set_page_config(
 
 st.title("SQL Server 2025 · Vector RAG Demo")
 st.caption(
-    "Ask any programming question — SQL Server handles the vector search, "
+    "Ask any programming question. SQL Server handles the vector search, "
     "Ollama generates the answer."
 )
 
-# Sidebar: configuration and stack status
+# Sidebar: config and stack status
 with st.sidebar:
     st.header("Stack")
     st.markdown(f"""
@@ -251,11 +252,11 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-# Initialise chat history
+# Set up chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Render existing chat history
+# Redraw the chat history so far
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -266,13 +267,13 @@ for msg in st.session_state.messages:
                     color = "green" if dist < 0.2 else "orange" if dist < 0.35 else "red"
                     st.markdown(
                         f"**:{color}[{dist:.3f}]** &nbsp; {r['title']}  \n"
-                        f"Tags: `{r.get('tags','—')}` · Score: {r.get('community_score',0)}"
+                        f"Tags: `{r.get('tags','none')}` · Score: {r.get('community_score',0)}"
                     )
 
 # Chat input at the bottom
 if question := st.chat_input("Ask a programming question…"):
 
-    # Show user message immediately
+    # Show the user's message right away
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
@@ -302,14 +303,14 @@ if question := st.chat_input("Ask a programming question…"):
                 state="complete",
             )
 
-        # Show retrieved context in an expander while the LLM generates
+        # Show the retrieved context in an expander while the LLM generates
         with st.expander(f"Retrieved context ({len(similar)} results)", expanded=False):
             for r in similar:
                 dist = r.get("distance", 0)
                 color = "green" if dist < 0.2 else "orange" if dist < 0.35 else "red"
                 st.markdown(
                     f"**:{color}[{dist:.3f}]** &nbsp; {r['title']}  \n"
-                    f"Tags: `{r.get('tags','—')}` · Score: {r.get('community_score',0)}"
+                    f"Tags: `{r.get('tags','none')}` · Score: {r.get('community_score',0)}"
                 )
 
         # ── Step 3: stream the LLM answer ────────────────────────────────────
@@ -328,7 +329,7 @@ if question := st.chat_input("Ask a programming question…"):
             f"Model: {LLM_MODEL}"
         )
 
-    # Persist the assistant message (with context for re-renders)
+    # Save the assistant message (with context, so re-renders can show it)
     st.session_state.messages.append({
         "role": "assistant",
         "content": answer_text,

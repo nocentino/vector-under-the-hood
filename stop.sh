@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Stop the stack.
-# Pass --wipe to also delete the SQL data volume (forces a fresh restore +
-# re-embedding on the next start). Host Ollama and the downloaded .bak are
-# left alone.
+# Stops the stack.
+# Pass --wipe to delete the SQL data volume too (you'll get a fresh restore +
+# re-embedding on the next start). Host Ollama and the downloaded .bak stay put.
 set -euo pipefail
 
 if [[ "${1:-}" == "--wipe" ]]; then

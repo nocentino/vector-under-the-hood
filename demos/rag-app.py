@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SQL Server 2025 Vectors: Under the Hood and Into Production
-Demo 03 Section 5 — Python RAG Application
+Demo 03 Section 5: Python RAG Application
 
 Retrieval-Augmented Generation over the StackOverflow dataset.
 
@@ -10,13 +10,13 @@ Architecture
 User question
     │
     ▼
-SQL Server 2025 — dbo.find_similar_questions
+SQL Server 2025: dbo.find_similar_questions
     ├── AI_GENERATE_EMBEDDINGS   ← SQL Server calls Ollama to embed the query
     ├── VECTOR_SEARCH (DiskANN)  ← ANN graph walk; exact kNN if the index is dropped
     └── TOP (K) results          ← returns the closest K questions + chunk text
     │
     ▼
-SQL Server 2025 — dbo.get_top_answer (per result)
+SQL Server 2025: dbo.get_top_answer (per result)
     └── accepted or highest-scored answer body
     │
     ▼
@@ -24,7 +24,7 @@ RAG prompt assembly
     └── "Answer this question using the following StackOverflow context..."
     │
     ▼
-Ollama LLM (llama3.2, mistral, etc.) — direct HTTP call from Python
+Ollama LLM (llama3.2, mistral, etc.): direct HTTP call from Python
     └── grounded answer
     │
     ▼
@@ -32,10 +32,10 @@ Output to the terminal
 
 Key design choices
 ──────────────────
-- SQL Server handles ALL embedding and retrieval. The app sends plain text.
+- SQL Server does ALL the embedding and retrieval. The app just sends text.
 - The Python app never writes a VECTOR_DISTANCE or VECTOR_SEARCH call.
-- The LLM is called directly from Python (not through SQL Server) because
-  generation requires a chat-capable model, not just an embedding model.
+- Python calls the LLM directly (not through SQL Server) because generation
+  needs a chat-capable model, not just an embedding model.
 - Connections use the least-privilege rag_app login from Demo 3.
 
 Requirements
@@ -46,7 +46,7 @@ Requirements
     SQL Server: localhost,1435  (the docker-compose stack from this repo)
     Ollama:     http://localhost:11434  (running on the host)
 
-    The LLM_MODEL must be pulled in Ollama before running:
+    You'll need LLM_MODEL pulled in Ollama before you run this:
         ollama pull llama3.2       # recommended
         ollama pull mistral        # lighter-weight alternative
 
@@ -82,15 +82,15 @@ SQL_PASSWORD = "RagP@ss2025!"
 OLLAMA_BASE_URL  = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 LLM_MODEL        = "llama3.2"   # must be pulled: `ollama pull llama3.2`
 
-TOP_K            = 5            # number of similar questions to retrieve
-MAX_ANSWER_CHARS = 800          # characters of answer body to include in context
-REQUEST_TIMEOUT  = 300          # seconds to wait for the LLM response (first load is slow)
+TOP_K            = 5            # how many similar questions to retrieve
+MAX_ANSWER_CHARS = 800          # how much of each answer body goes into the context
+REQUEST_TIMEOUT  = 300          # seconds to wait on the LLM (the first load is slow)
 
 
 # ─── HTML helper ──────────────────────────────────────────────────────────────
 
 class _HTMLStripper(html.parser.HTMLParser):
-    """Minimal HTML-to-plain-text converter using only the standard library."""
+    """Bare-bones HTML-to-text converter that only needs the standard library."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -100,8 +100,8 @@ class _HTMLStripper(html.parser.HTMLParser):
         self._parts.append(data)
 
     def handle_starttag(self, tag: str, attrs) -> None:
-        # Insert a newline before block-level elements so code blocks and
-        # paragraphs are still readable in plain text.
+        # Add a newline before block-level elements so code blocks and
+        # paragraphs stay readable as plain text.
         if tag in ("p", "br", "li", "pre", "div", "h1", "h2", "h3"):
             self._parts.append("\n")
 
@@ -110,7 +110,7 @@ class _HTMLStripper(html.parser.HTMLParser):
 
 
 def strip_html(raw: str) -> str:
-    """Strip HTML tags and unescape entities, returning readable plain text."""
+    """Strips HTML tags and unescapes entities so you get readable text."""
     stripper = _HTMLStripper()
     stripper.feed(raw)
     return stripper.get_text()
@@ -119,7 +119,7 @@ def strip_html(raw: str) -> str:
 # ─── Database helpers ─────────────────────────────────────────────────────────
 
 def _get_driver() -> str:
-    """Return the best available ODBC driver name for SQL Server."""
+    """Returns the best ODBC driver for SQL Server that's installed."""
     for driver in ("ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server"):
         if driver in pyodbc.drivers():
             return driver
@@ -131,7 +131,7 @@ def _get_driver() -> str:
 
 
 def get_connection() -> pyodbc.Connection:
-    """Open a connection to SQL Server using the least-privilege rag_app login."""
+    """Opens a SQL Server connection as the least-privilege rag_app login."""
     driver = _get_driver()
     conn_str = (
         f"DRIVER={{{driver}}};"
@@ -151,15 +151,15 @@ def find_similar_questions(
     top: int = TOP_K,
 ) -> list[dict]:
     """
-    Call dbo.find_similar_questions.
+    Calls dbo.find_similar_questions.
 
-    SQL Server handles:
-      - Embedding @prompt via AI_GENERATE_EMBEDDINGS (calls host Ollama)
-      - VECTOR_SEARCH over the DiskANN index (exact kNN while it's rebuilt)
-      - Returning the top-K most semantically similar questions
+    SQL Server does the work:
+      - Embeds @prompt via AI_GENERATE_EMBEDDINGS (calls host Ollama)
+      - Runs VECTOR_SEARCH over the DiskANN index (exact kNN while it's rebuilt)
+      - Returns the top-K most semantically similar questions
 
-    The application sends plain text.  The embedding and vector search are
-    entirely database operations.  The returned rows contain no VECTOR data.
+    The app sends plain text. Embedding and vector search happen entirely
+    in the database, and the rows that come back have no VECTOR data.
     """
     cursor = conn.cursor()
     cursor.execute(
@@ -176,10 +176,10 @@ def get_top_answer(
     question_post_id: int,
 ) -> Optional[dict]:
     """
-    Call dbo.get_top_answer to retrieve the accepted (or highest-scored) answer
-    for a given StackOverflow question post ID.
+    Calls dbo.get_top_answer to get the accepted (or highest-scored) answer
+    for a StackOverflow question post ID.
 
-    Returns None when no answer rows exist for that question.
+    Returns None if the question has no answers.
     """
     cursor = conn.cursor()
     cursor.execute(
@@ -197,12 +197,12 @@ def get_top_answer(
 
 def call_ollama(prompt: str, model: str = LLM_MODEL) -> str:
     """
-    Call the Ollama LLM for text generation using /api/generate (non-streaming).
+    Calls the Ollama LLM for text generation via /api/generate (non-streaming).
 
-    The LLM call is made from Python, not from SQL Server.  SQL Server's
+    Python makes this call, not SQL Server. SQL Server's
     AI_GENERATE_EMBEDDINGS uses an EMBEDDINGS model (nomic-embed-text).
-    Generating a grounded answer requires a chat/instruct model (llama3.2, etc.).
-    These are two different models with different roles:
+    A grounded answer needs a chat/instruct model (llama3.2, etc.).
+    That's two different models doing two different jobs:
 
       nomic-embed-text   →  SQL Server  →  converts text to VECTOR(768)
       llama3.2           →  Python      →  generates a natural-language answer
@@ -234,13 +234,13 @@ def call_ollama(prompt: str, model: str = LLM_MODEL) -> str:
 
 def build_rag_prompt(user_question: str, results: list[dict]) -> str:
     """
-    Assemble the RAG prompt from:
+    Builds the RAG prompt from:
       - The user's question
       - Retrieved StackOverflow questions (titles, tags, scores)
       - Their top answers (truncated, HTML-stripped)
 
-    The prompt instructs the LLM to answer using only the provided context
-    and to say so if the context is insufficient.
+    The prompt tells the LLM to answer only from that context, and to say
+    so if the context isn't enough.
     """
     context_blocks: list[str] = []
 
@@ -283,7 +283,7 @@ ANSWER:"""
 
 def answer_question(user_question: str) -> None:
     """
-    Full RAG pipeline for one question:
+    The full RAG pipeline for one question:
 
       1. Retrieve top-K semantically similar questions via SQL Server
       2. Fetch the best answer for each retrieved question
@@ -319,7 +319,7 @@ def answer_question(user_question: str) -> None:
             answer = get_top_answer(conn, q["post_id"])
             q["answer_body"] = answer["answer_body"] if answer else None
     finally:
-        conn.close()   # pyodbc's context manager commits but doesn't close
+        conn.close()   # pyodbc's context manager commits but won't close
 
     # ── Step 3: assemble prompt ───────────────────────────────────────────────
     print(f"\n[3/4] Assembling RAG prompt…")
@@ -337,7 +337,7 @@ def answer_question(user_question: str) -> None:
     print("═" * 72)
     print("ANSWER")
     print("═" * 72)
-    # Wrap long lines for terminal readability:
+    # Wrap long lines so they read well in a terminal:
     for paragraph in answer_text.split("\n"):
         if paragraph.strip():
             print(textwrap.fill(paragraph, width=72))
@@ -350,12 +350,12 @@ def answer_question(user_question: str) -> None:
 
 def main() -> None:
     if len(sys.argv) > 1:
-        # Single question from command line:
+        # One question from the command line:
         question = " ".join(sys.argv[1:])
         answer_question(question)
     else:
         # Interactive REPL:
-        print("SQL Server 2025 RAG App — StackOverflow Q&A")
+        print("SQL Server 2025 RAG App: StackOverflow Q&A")
         print(f"  Embedding + retrieval: SQL Server at {SQL_SERVER}")
         print(f"  Answer generation:     Ollama ({LLM_MODEL}) at {OLLAMA_BASE_URL}")
         print("Type a question and press Enter.  Ctrl+C to exit.\n")

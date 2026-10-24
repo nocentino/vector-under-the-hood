@@ -7,8 +7,8 @@
 #                                StackOverflow + VECTOR data ───┘
 #
 # Ollama runs on the HOST (GPU-accelerated, already downloaded). NGINX adds
-# the TLS that SQL Server 2025's EXTERNAL MODEL requires and reverse-proxies
-# to host Ollama. SQL Server is restored and fully vectorized automatically.
+# the TLS that SQL Server 2025's EXTERNAL MODEL needs and reverse-proxies
+# to host Ollama. SQL Server gets restored and vectorized for you.
 #
 # Services
 # ─────────────────────────────────────────────────────────────────────────────
@@ -22,10 +22,10 @@ services:
 
   # ── 1. Generate the self-signed TLS cert ─────────────────────────────────
   # SQL Server 2025 only calls embedding endpoints over HTTPS, so NGINX sits
-  # in front of host Ollama. The cert is generated once and reused — do NOT
-  # regenerate on every compose-up (SQL Server trusts the cert by file hash;
-  # a new cert after startup breaks the TLS handshake until sql1 restarts).
-  # Delete certs/nginx.crt + certs/nginx.key to force a fresh cert.
+  # in front of host Ollama. The cert is generated once and reused. DON'T
+  # regenerate it on every compose-up (SQL Server trusts the cert by file hash,
+  # so a new cert after startup breaks the TLS handshake until sql1 restarts).
+  # Delete certs/nginx.crt + certs/nginx.key if you want a fresh cert.
   config:
     build:
       context: .
@@ -73,13 +73,13 @@ services:
       - "1435:1433"    # use 1435 externally to avoid conflicts with other local SQL instances
     volumes:
       - sql-data:/var/opt/mssql
-      # Mount the NGINX cert into SQL Server's trusted CA store so the
-      # HTTPS call to the embedding endpoint (EXTERNAL MODEL) is trusted.
+      # Mount the NGINX cert into SQL Server's trusted CA store so SQL Server
+      # trusts the HTTPS call to the embedding endpoint (EXTERNAL MODEL).
       - "./certs/nginx.crt:/var/opt/mssql/security/ca-certificates/public.crt:ro"
       - "./backups:/var/opt/mssql/backups/"
     environment:
       - ACCEPT_EULA=Y
-      - MSSQL_SA_PASSWORD=S0methingS@Str0ng!   # demo only — throwaway password
+      - MSSQL_SA_PASSWORD=S0methingS@Str0ng!   # demo only, throwaway password
       - MSSQL_PID=Developer
     healthcheck:
       test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"S0methingS@Str0ng!\" -C -l 5 -t 5 -h -1 -Q \"SET NOCOUNT ON; SELECT 'PROBEOK'\" 2>/dev/null | grep -q '^PROBEOK$$'"]
@@ -89,7 +89,7 @@ services:
       start_period: 30s
 
   # ── 4. One-shot database init ─────────────────────────────────────────────
-  # Waits for sql1 to be healthy, then runs setup/init.sql which:
+  # Waits for sql1 to go healthy, then runs setup/init.sql, which:
   #   - Restores the StackOverflowMini database
   #   - Enables external REST endpoint
   #   - Creates the EXTERNAL MODEL (pointing at NGINX → host Ollama)
@@ -97,7 +97,7 @@ services:
   #   - Generates embeddings for top 1,000 questions via AI_GENERATE_EMBEDDINGS
   #   - Builds the DiskANN CREATE VECTOR INDEX
   #   - Creates stored procedures and least-privilege logins for the demos
-  # Exits 0 when done. Re-running is safe (script is idempotent).
+  # Exits 0 when it's done. Re-running is safe (the script is idempotent).
   sql-init:
     platform: linux/amd64
     image: mcr.microsoft.com/mssql-tools
@@ -114,13 +114,13 @@ services:
       - ./setup:/setup:ro
     entrypoint: >
       /bin/bash -c "
-        echo 'SQL Server healthy — running setup/init.sql...';
+        echo 'SQL Server healthy, running setup/init.sql...';
         /opt/mssql-tools/bin/sqlcmd -S sql1 -U sa -P 'S0methingS@Str0ng!' -b -i /setup/init.sql || { echo 'Init FAILED.'; exit 1; };
         echo 'Init complete.'"
 
   # ── 5. Python RAG app (optional, profile "app") ───────────────────────────
-  # Runs rag-app.py / rag-app-ui.py with the ODBC driver inside Linux, so the
-  # host needs no ODBC driver or OpenSSL setup. Not started by `up` by default:
+  # Runs rag-app.py / rag-app-ui.py with the ODBC driver inside Linux, so you
+  # don't need an ODBC driver or OpenSSL setup on the host. `up` doesn't start it:
   #   docker compose run --rm rag-app python demos/rag-app.py "your question"
   #   docker compose --profile app up rag-app-ui      # http://localhost:8501
   rag-app: &rag-app

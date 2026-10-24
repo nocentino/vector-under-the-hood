@@ -2,26 +2,26 @@
 # setup/expand-embeddings.sh
 #
 # Grows QuestionEmbeddings from the initial 1,000 rows to 10,000 by embedding
-# the next highest-scored StackOverflow questions not yet in the table.
+# the next highest-scored StackOverflow questions that aren't in the table yet.
 #
-# Run from the repo root after the initial stack start:
+# Run it from the repo root after the stack's first start:
 #
 #   bash setup/expand-embeddings.sh
 #
 # Timing reference (Apple Silicon M2, Ollama on the host):
 #   ~20 sec per 100 embeddings  →  ~30 minutes for the full 10,000
 #
-# The script is idempotent — safe to re-run or resume after a failure.
-# The NOT EXISTS guard in each INSERT batch skips already-embedded rows.
-# Batches that hit the external REST timeout (Msg 31629) are retried
-# automatically on the next iteration.
+# It's idempotent, so you can re-run it or resume after a failure.
+# The NOT EXISTS guard in each INSERT batch skips rows already embedded.
+# Batches that hit the external REST timeout (Msg 31629) get retried
+# on the next iteration.
 #
-# What this script does:
+# Here's what it does:
 #   1. Drops the DiskANN index (required for bulk INSERT on SQL Server 2025)
 #   2. Shell while loop: sends 100-row INSERT batches to SQL Server until
 #      dbo.QuestionEmbeddings has 10,000 rows. 100-row batches (~20 s each)
-#      stay well within SQL Server's external REST endpoint timeout, unlike
-#      1,000-row batches (~90–165 s) which hit Msg 31629 inconsistently.
+#      stay well inside SQL Server's external REST endpoint timeout.
+#      1,000-row batches (~90-165 s) hit Msg 31629 inconsistently.
 #   3. Rebuilds the DiskANN index over all 10,000 rows
 #   4. Reports elapsed time
 
@@ -30,8 +30,8 @@ set -euo pipefail
 SA_PASSWORD='S0methingS@Str0ng!'
 CONTAINER='sql1'
 TARGET=10000
-BATCH=100   # 100-row batches (~20 s each) reliably stay within the external REST timeout.
-            # 1,000-row batches (~90–165 s) hit Msg 31629 inconsistently.
+BATCH=100   # 100-row batches (~20 s each) stay inside the external REST timeout.
+            # 1,000-row batches (~90-165 s) hit Msg 31629 inconsistently.
 
 # ── Helper: run sqlcmd inside the container ───────────────────────────────────
 run_sql() {
@@ -69,8 +69,8 @@ GO"
 
 # ── Step 2: Shell while loop: 100-row batches until TARGET ───────────────────
 # Each iteration calls sqlcmd once. If Msg 31629 fires (external REST timeout),
-# the INSERT rolls back, the error message is printed, and the loop retries
-# the same rows on the next iteration. The NOT EXISTS guard is idempotent.
+# the INSERT rolls back, you see the error, and the loop retries the same rows
+# on the next pass. The NOT EXISTS guard keeps that idempotent.
 echo ""
 echo "[$(date '+%H:%M:%S')]  Starting embedding loop (target: $TARGET rows, batch: $BATCH)..."
 echo ""
@@ -110,7 +110,7 @@ GO" 2>&1 || true)
     total=${total:-0}
 
     if echo "$result" | grep -q "31629"; then
-        echo "[$(date '+%H:%M:%S')] Batch $batch_num: REST timeout — retrying (rows still: ${total:-?})"
+        echo "[$(date '+%H:%M:%S')] Batch $batch_num: REST timeout, retrying (rows still: ${total:-?})"
         total=$prev_total
     elif [ "$total" -le "$prev_total" ]; then
         failures=$(( ${failures:-0} + 1 ))
@@ -123,7 +123,7 @@ GO" 2>&1 || true)
         total=$prev_total
     else
         failures=0
-        echo "[$(date '+%H:%M:%S')] Batch $batch_num done — rows now: $total"
+        echo "[$(date '+%H:%M:%S')] Batch $batch_num done, rows now: $total"
     fi
 done
 

@@ -6,7 +6,7 @@ GO
 =============================================================================
   SQL Server 2025 Vectors: Under the Hood and Into Production
 
-  Demo 2 of 3 — VECTOR INDEX PERFORMANCE AND LIMITATIONS
+  Demo 2 of 3: VECTOR INDEX PERFORMANCE AND LIMITATIONS
   DiskANN internals  ·  ANN vs. kNN recall  ·  IO comparison  ·  Real limits
   Latest-version improvements (Azure SQL DB / Fabric)
 =============================================================================
@@ -18,20 +18,20 @@ GO
     Demo 1 complete. StackOverflow is restored and QuestionEmbeddings is
     populated. The vec_idx DiskANN index was created at startup by sql-init.
 
-  RECOMMENDED — expand to 10,000 rows. The numbers in this file assume it:
-    The startup script embeds 1,000 questions. For the full 10,000-row corpus
-    (needed for §2 IO comparison, §2b scale, and §4f), run:
+  RECOMMENDED: expand to 10,000 rows. The numbers in this file assume it.
+    The startup script embeds 1,000 questions. You'll need the full 10,000-row
+    corpus for the §2 IO comparison, §2b scale, and §4f, so run:
 
         bash setup/expand-embeddings.sh
 
-    (~30 min on an M2 with Ollama on the host — see script for batch progress).
+    (~30 min on my M2 with Ollama on the host. The script shows batch progress.)
 
   Connect:
     Server:   localhost,1435
     Login:    sa
     Password: S0methingS@Str0ng!   (demo only)
 
-  Run sections top-to-bottom. Every section is idempotent.
+  Run the sections top to bottom. Every one is idempotent.
 
   TIME BUDGET: 25 of the 60 demo minutes (75-minute slot, 15 for Q&A).
     1a     how DiskANN works          5 min
@@ -51,20 +51,20 @@ GO
 
 
 /* =============================================================================
-   SECTION 1 — THE DiskANN INDEX: WHAT IT IS AND HOW TO BUILD IT
+   SECTION 1. THE DiskANN INDEX: WHAT IT IS AND HOW TO BUILD IT
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
    1a. What DiskANN is (conceptually)
    -----------------------------------------------------------------------------
    DiskANN is a graph-based Approximate Nearest Neighbor (ANN) system from
-   Microsoft Research (Subramanya et al., NeurIPS 2019). 
-   https://suhasjs.github.io/files/diskann_neurips19.pdf It's designed to
-   index and search a billion-point dataset on a single node with just 64 GB
-   RAM and an SSD. In-memory indexes like HNSW require the entire index to fit
-   in RAM, DiskANN doesn't.
+   Microsoft Research (Subramanya et al., NeurIPS 2019):
+     https://suhasjs.github.io/files/diskann_neurips19.pdf
+   It's built to index and search a billion-point dataset on a single node
+   with just 64 GB of RAM and an SSD. In-memory indexes like HNSW need the
+   whole index to fit in RAM. DiskANN doesn't.
 
-   The internal graph algorithm is called Vamana. DiskANN is the full system
+   The graph algorithm inside is called Vamana. DiskANN is the full system
    (Vamana graph + SSD-based search + quantization pipeline). SQL Server 2025
    implements the Vamana graph index and calls it DiskANN.
 
@@ -72,12 +72,12 @@ GO
 
      - Every vector in the table is a NODE
      - Each node has directed out-edges to its approximate nearest neighbors
-     - Vamana builds graphs with smaller diameter than HNSW and NSG —
-       fewer hops means fewer disk reads at query time (§1.1)
+     - Vamana builds graphs with smaller diameter than HNSW and NSG.
+       Fewer hops means fewer disk reads at query time (§1.1)
 
-   Graph structure (simplified). s is the medoid, the fixed entry point. Most
-   edges are local. Vamana's pruning with α > 1 also keeps long-range edges.
-   HNSW and NSG effectively use α = 1, which is why Vamana gets a smaller
+   Here's a simplified picture. s is the medoid, the fixed entry point. Most
+   edges are local, but Vamana's pruning with α > 1 also keeps long-range
+   edges. HNSW and NSG effectively use α = 1, which is why Vamana gets a smaller
    diameter at the same degree (§2.4):
 
       s (medoid) ──────────────────────────────────────── (far)  ← long-range edge
@@ -92,14 +92,14 @@ GO
           (G)
 
    At query time, the engine runs GreedySearch (Algorithm 1 in the paper):
-     1. Start at the graph's medoid s — the fixed entry node for all queries
+     1. Start at the graph's medoid s, the fixed entry node for all queries
      2. Pick p* = the unvisited candidate in L closest to the query vector
      3. Add p*'s out-neighbors to L; mark p* as visited
      4. If |L| exceeds the search list size, prune to the closest L points
      5. Repeat until every candidate in L is visited; return the top k
 
-   GreedySearch toward query q (k=2, simplified, lower dist = closer match).
-   Follow the path s → A → C → G through the graph above:
+   Let's walk GreedySearch toward query q (k=2, simplified, lower dist =
+   closer match). Follow the path s → A → C → G through the graph above:
 
       start   L = { s(0.82) }
       hop 1   p* = s  →  L = { A(0.61),  B(0.74),  far(0.95) }
@@ -107,7 +107,7 @@ GO
       hop 3   p* = C  →  L = { G(0.31),  D(0.58),  B(0.74),  far(0.95) }
       hop 4   p* = G  →  no closer unvisited  →  done
 
-      return top 2: G(0.31), D(0.58)  — 4 nodes visited, rest skipped
+      return top 2: G(0.31), D(0.58)  (4 nodes visited, rest skipped)
 
    The paper proves (§2.2) that with α > 1, GreedySearch converges in
    logarithmically many steps. In practice, Vamana makes 2–3× fewer hops
@@ -115,8 +115,8 @@ GO
    >5,000 QPS at <3ms latency with 95%+ recall. That's the speed win
    versus O(n) for a full table scan.
 
-   The trade-off: it's approximate. It may miss some true nearest neighbors.
-   Section 3 shows how often that happens (spoiler: rarely).
+   The trade-off: it's approximate, so it can miss some true nearest
+   neighbors. Section 3 shows how often that happens (spoiler: rarely).
 
    SQL Server 2025 ships DiskANN as a PREVIEW feature. You opt in at the
    database level before creating the index.
@@ -136,20 +136,20 @@ GO
 
 
 /* -----------------------------------------------------------------------------
-   1b. Building the DiskANN index — and watching the clock
+   1b. Building the DiskANN index (and watching the clock)
    -----------------------------------------------------------------------------
-   The build phase:
+   Here's what the build does:
      1. Reads every vector in the table
      2. Runs the Vamana build: a GreedySearch from the medoid for every point,
         then prunes each node's edges down to the degree bound R
      3. Persists the graph to internal tables (Section 1c shows them)
 
    MAXDOP: the CREATE VECTOR INDEX syntax accepts it, but SQL Server 2025
-   ignores it. That's a documented known issue, so we leave it off.
+   ignores it. That's a documented known issue, so I leave it off.
      https://learn.microsoft.com/en-us/sql/sql-server/sql-server-2025-known-issues
 
-   We drop and rebuild here so you can see the actual timing. Measured on
-   this stack (SQL Server 2025 CU10, Apple Silicon M2):
+   Let's drop and rebuild so you can see the real timing. Here's what I
+   measured on this stack (SQL Server 2025 CU10, Apple Silicon M2):
      1,000 rows    ~11 seconds
      10,000 rows   anywhere from ~23 seconds to ~2 minutes on a running
                    instance, and ~340 seconds right after a restart
@@ -161,7 +161,7 @@ GO
    on time, skip the DROP/CREATE and just run 1c against the existing index.
 
    NOTE: SQL Server 2025 (earlier-version DiskANN) makes the table READ-ONLY
-   while the vector index exists. Section 4a covers this limitation in detail.
+   while the vector index exists. Section 4a digs into it.
 ----------------------------------------------------------------------------- */
 
 -- Remove the existing index so we can time a fresh build:
@@ -186,8 +186,8 @@ GO
 /* -----------------------------------------------------------------------------
    1c. Inspecting the index in the catalog
    -----------------------------------------------------------------------------
-   After the build, the vector index appears in sys.indexes alongside the
-   clustered index on the same table. type_desc identifies it.
+   After the build, the vector index shows up in sys.indexes next to the
+   table's clustered index. Notice the type_desc column.
 ----------------------------------------------------------------------------- */
 
 -- All indexes on QuestionEmbeddings:
@@ -256,16 +256,16 @@ GO
 
 
 /* =============================================================================
-   SECTION 2 — PERFORMANCE: ANN vs. kNN SIDE-BY-SIDE IO COMPARISON
+   SECTION 2. PERFORMANCE: ANN vs. kNN SIDE-BY-SIDE IO COMPARISON
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
-   The same semantic question, answered two ways — exact kNN (table scan) and
-   approximate ANN (DiskANN graph walk). SET STATISTICS IO / TIME shows the
-   exact cost of each path in logical reads and elapsed milliseconds.
+   Let's answer the same question two ways: exact kNN (table scan) and
+   approximate ANN (DiskANN graph walk). SET STATISTICS IO / TIME shows what
+   each path costs in logical reads and elapsed milliseconds.
 
    Watch the Messages tab while each query runs. The numbers tell the story
-   more clearly than any benchmark chart.
+   better than any benchmark chart.
 ----------------------------------------------------------------------------- */
 
 -- ── Exact kNN ─────────────────────────────────────────────────────────────────
@@ -273,7 +273,7 @@ PRINT '--- EXACT kNN (full table scan) ---';
 SET STATISTICS IO ON;
 SET STATISTICS TIME ON;
 GO
-DECLARE @search_text   NVARCHAR(MAX) = N'my git history is a mess — how do I clean it up before code review?';
+DECLARE @search_text   NVARCHAR(MAX) = N'my git history is a mess - how do I clean it up before code review?';
 DECLARE @search_vector VECTOR(768)   = AI_GENERATE_EMBEDDINGS(@search_text USE MODEL ollama);
 
 -- Rank in the satellite table, then join the 10 winners (Demo 01 Section 5a).
@@ -298,7 +298,7 @@ PRINT '--- ANN (DiskANN graph walk) ---';
 SET STATISTICS IO ON;
 SET STATISTICS TIME ON;
 GO
-DECLARE @search_text   NVARCHAR(MAX) = N'my git history is a mess — how do I clean it up before code review?';
+DECLARE @search_text   NVARCHAR(MAX) = N'my git history is a mess - how do I clean it up before code review?';
 DECLARE @search_vector VECTOR(768)   = AI_GENERATE_EMBEDDINGS(@search_text USE MODEL ollama);
 
 SELECT
@@ -325,14 +325,14 @@ GO
 --                      kNN (scan)      ANN (graph walk)
 --   QuestionEmbeddings  7,057 reads     2,265 reads
 --   Worktable               0             671 reads
---   Graph edge table        —              50 reads
+--   Graph edge table        -              50 reads
 --   Total reads         7,057           2,986
 --   CPU time            37-63 ms        8-11 ms
 --   Elapsed time        13-28 ms        7-10 ms
 --
 -- So ANN wins, but not by the 100× the graph reads alone (50) might suggest.
 -- The graph itself is cheap (50 reads). Most of the ANN cost is reads on
--- QuestionEmbeddings itself. The IO suggests the walk fetches the stored
+-- QuestionEmbeddings. The IO suggests the walk fetches the stored
 -- vector for the candidates it scores, much like the paper's full-precision
 -- re-ranking (§3.5). The docs don't describe this, so treat it as observed.
 --
@@ -427,7 +427,7 @@ GO
 
 
 /* =============================================================================
-   SECTION 3 — RECALL: MEASURING ANN ACCURACY AGAINST EXACT kNN
+   SECTION 3. RECALL: MEASURING ANN ACCURACY AGAINST EXACT kNN
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
@@ -439,16 +439,16 @@ GO
    recall number that matters is the one you measure on your data.
 
    This matters for RAG: if ANN misses the single best-matching chunk,
-   your LLM gets worse context. A high-recall ANN index means you get
-   near-exact quality with a fraction of the cost.
+   your LLM gets worse context. A high-recall ANN index gets you
+   near-exact quality at a fraction of the cost.
 
-   We run the measurement for a single test query here. In production you'd
+   Here we measure a single test query. In production you'd
    average over hundreds of representative queries to get a stable recall
    estimate for your dataset and model.
 ----------------------------------------------------------------------------- */
 
--- All of the following runs in one batch (no GO) so variables are in scope
--- for both the kNN and ANN queries.
+-- Everything below runs in one batch (no GO), so the variables stay in
+-- scope for both the kNN and ANN queries.
 
 SET NOCOUNT ON;
 
@@ -515,13 +515,14 @@ GO
 -- WHAT THE RECALL NUMBER TELLS YOU:
 --   recall_at_k = 1.0  → ANN returned identical results to exhaustive search.
 --   recall_at_k = 0.9  → 9 of 10 results match; 1 true neighbor was missed.
---   For a RAG workload the missed neighbor would need to be the #1 most relevant
---   chunk AND the other 9 would need to be irrelevant — a pathological scenario.
+--   For a RAG workload to suffer, the missed neighbor would have to be the #1
+--   most relevant chunk AND the other 9 would have to be irrelevant. That's a
+--   pathological case.
 --   In practice, high recall (> 0.95) means your retrieval quality is intact.
 
 
 /* =============================================================================
-   SECTION 4 — LIMITATIONS: WHERE VECTOR INDEXES HELP AND WHERE THEY DON'T
+   SECTION 4. LIMITATIONS: WHERE VECTOR INDEXES HELP AND WHERE THEY DON'T
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
@@ -535,18 +536,18 @@ GO
    In SQL Server 2025 (the "earlier-version" DiskANN index), creating a vector
    index makes the underlying table READ-ONLY. INSERT, UPDATE, DELETE, and
    MERGE fail with Msg 42231. TRUNCATE TABLE fails with Msg 42232. The docs
-   list the read-only rule but not the error numbers; these are what this
+   list the read-only rule but not the error numbers. These are what this
    build returns.
 
    ALLOW_STALE_VECTOR_INDEX isn't an option here. The docs say it "isn't
    currently available in SQL Server 2025", and it fails with Msg 102.
 
-   This is a significant operational constraint for workloads that need to
-   continuously add new embeddings as new content arrives.
+   That's a big operational problem if your workload keeps adding new
+   embeddings as new content arrives.
 
-     WORKAROUND — Drop-insert-rebuild cycle: offline maintenance window
-                    (the only option on SQL Server 2025 on-prem today).
-                    Demo 03 Section 4a runs it live.
+     WORKAROUND: Drop-insert-rebuild cycle in an offline maintenance
+                 window (the only option on SQL Server 2025 on-prem today).
+                 Demo 03 Section 4a runs it live.
 
    On the latest-version index: no workaround needed. Tables are fully
    writable and the index maintains itself in the background.
@@ -558,8 +559,8 @@ WHERE object_id = OBJECT_ID('dbo.QuestionEmbeddings');
 GO
 
 -- Try to INSERT with the vector index in place:
--- Msg 42231 is not catchable with TRY/CATCH — it surfaces as a hard error.
--- Run this and watch the error message appear directly.
+-- Msg 42231 isn't catchable with TRY/CATCH. It surfaces as a hard error,
+-- so run this and watch the message come back directly.
 INSERT INTO dbo.QuestionEmbeddings (PostId, chunk, embeddings)
 VALUES (
     999999,
@@ -572,7 +573,7 @@ GO
 
 
 /* -----------------------------------------------------------------------------
-   4b. [OPTIONAL] LIMITATION: Filtered search — no predicate pushdown into the graph
+   4b. [OPTIONAL] LIMITATION: Filtered search (no predicate pushdown into the graph)
    -----------------------------------------------------------------------------
    STATUS: This limitation exists in SQL Server 2025 on-premises (earlier-
    version DiskANN). It's RESOLVED by iterative filtering in the latest-
@@ -582,20 +583,19 @@ GO
    ENTIRE graph, and THEN the outer query's WHERE clause filters that candidate
    set. The filter is NOT pushed into the graph traversal.
 
-   Risk: if your filter is very selective, all TOP_N ANN candidates may fail
-   the filter — returning zero rows, even though an exact kNN search would have
+   Risk: if your filter is very selective, every TOP_N ANN candidate can fail
+   it. You get zero rows back, even though an exact kNN search would have
    found matches.
 
-   Mitigation (SQL Server 2025 on-prem): increase TOP_N to produce a larger
-   candidate pool, giving the post-filter more material to work with.
-   This is sometimes called "oversampling."
+   Mitigation (SQL Server 2025 on-prem): raise TOP_N so the post-filter has
+   a bigger candidate pool to work with. That's often called "oversampling."
 ----------------------------------------------------------------------------- */
 
 -- Shared query text for all three variants below:
 DECLARE @search_text   NVARCHAR(MAX) = N'how do I center a div vertically and horizontally';
 DECLARE @search_vector VECTOR(768)   = AI_GENERATE_EMBEDDINGS(@search_text USE MODEL ollama);
 
--- Version 1: tight TOP_N (5) + selective filter — may return fewer than 5 rows:
+-- Version 1: tight TOP_N (5) + selective filter. It may return fewer than 5 rows:
 PRINT '--- ANN: TOP_N = 5, Score > 500 (tight filter) ---';
 SELECT
     t.PostId,
@@ -614,7 +614,7 @@ WHERE p.Score > 500    -- post-filter: may eliminate all 5 ANN candidates
 ORDER BY s.distance;
 GO
 
--- Version 2: oversampled TOP_N (50) + same filter — post-filter has more material:
+-- Version 2: oversampled TOP_N (50) + same filter, so the post-filter has more to work with:
 DECLARE @search_text   NVARCHAR(MAX) = N'how do I center a div vertically and horizontally';
 DECLARE @search_vector VECTOR(768)   = AI_GENERATE_EMBEDDINGS(@search_text USE MODEL ollama);
 
@@ -636,7 +636,7 @@ WHERE p.Score > 500
 ORDER BY s.distance;
 GO
 
--- Version 3: exact kNN with same filter — the "correct" answer for comparison:
+-- Version 3: exact kNN with the same filter. That's the "correct" answer to compare against:
 DECLARE @search_text   NVARCHAR(MAX) = N'how do I center a div vertically and horizontally';
 DECLARE @search_vector VECTOR(768)   = AI_GENERATE_EMBEDDINGS(@search_text USE MODEL ollama);
 
@@ -648,21 +648,21 @@ SELECT TOP (5)
     VECTOR_DISTANCE('cosine', @search_vector, qe.embeddings) AS distance
 FROM dbo.QuestionEmbeddings qe
 JOIN dbo.Posts p ON qe.PostId = p.Id
-WHERE p.Score > 500    -- filter runs over the full scan — always correct
+WHERE p.Score > 500    -- filter runs over the full scan, so it's always correct
 ORDER BY distance;
 GO
 
 -- TAKEAWAY: for ANN + filter workloads, oversample TOP_N by the inverse of
 -- your filter selectivity. If roughly 1 in 10 rows passes the filter, use
--- TOP_N = 10 × your desired K to maintain result quality.
+-- TOP_N = 10 × your desired K to keep result quality up.
 
 
 /* -----------------------------------------------------------------------------
    4c. [OPTIONAL] LIMITATION: Dimensionality constraints
    -----------------------------------------------------------------------------
    The VECTOR type in SQL Server 2025 supports 1 to 1,998 dimensions (float32)
-   or 1 to 3,996 dimensions (float16 — see Demo 01 Section 1e).
-   This covers all common embedding models:
+   or 1 to 3,996 dimensions (float16, see Demo 01 Section 1e).
+   That covers all the common embedding models:
 
      nomic-embed-text             768 dimensions   (this demo)
      mxbai-embed-large           1024 dimensions
@@ -677,7 +677,7 @@ GO
    A vector index can only be built on a VECTOR(n) column with a fixed,
    known n. You can't index a column that stores vectors of varying dimensions.
 
-   Changing models (e.g., upgrading from 768-dim to 1536-dim) requires:
+   Changing models (say, from 768-dim to 1536-dim) means:
      - A new or altered VECTOR column with the new dimension count
      - Re-embedding ALL rows (existing vectors are from a different model's
        coordinate space and aren't comparable to new-model vectors)
@@ -685,7 +685,7 @@ GO
 ----------------------------------------------------------------------------- */
 
 -- Show the current column definition using the new sys.columns metadata:
--- (vector_dimensions is preferred over max_length/4 — see Demo 01 Section 1e)
+-- (vector_dimensions is preferred over max_length/4; see Demo 01 Section 1e)
 SELECT
     c.name,
     t.name                  AS type_name,
@@ -697,11 +697,11 @@ WHERE c.object_id = OBJECT_ID('dbo.QuestionEmbeddings')
   AND t.name      = 'vector';
 GO
 
--- Attempt to exceed the float32 maximum — shows the enforced limit:
+-- Let's try to go past the float32 maximum and see the enforced limit:
 -- Msg 2717 is a compile error, so it has to run in its own scope to be caught.
 BEGIN TRY
     EXEC (N'CREATE TABLE #dim_test ( v VECTOR(1999) );');
-    PRINT 'VECTOR(1999) created — current limit is above 1998.';
+    PRINT 'VECTOR(1999) created: current limit is above 1998.';
 END TRY
 BEGIN CATCH
     PRINT 'Error: ' + ERROR_MESSAGE();
@@ -710,10 +710,10 @@ BEGIN CATCH
 END CATCH;
 GO
 
--- float16 allows up to 3,996 dims — can hold text-embedding-3-large (3072):
+-- float16 allows up to 3,996 dims, enough for text-embedding-3-large (3072):
 BEGIN TRY
     CREATE TABLE #dim_float16 ( v VECTOR(3072, float16) );
-    PRINT 'VECTOR(3072, float16) created — float16 ceiling is 3,996 dims.';
+    PRINT 'VECTOR(3072, float16) created: float16 ceiling is 3,996 dims.';
     DROP TABLE IF EXISTS #dim_float16;
 END TRY
 BEGIN CATCH
@@ -724,7 +724,7 @@ GO
 -- The confirmed float32 maximum (1998):
 BEGIN TRY
     CREATE TABLE #dim_max ( v VECTOR(1998) );
-    PRINT 'VECTOR(1998) created — max float32 dimensions in SQL Server 2025.';
+    PRINT 'VECTOR(1998) created: max float32 dimensions in SQL Server 2025.';
     DROP TABLE IF EXISTS #dim_max;
 END TRY
 BEGIN CATCH
@@ -736,7 +736,7 @@ GO
 /* -----------------------------------------------------------------------------
    4d. [OPTIONAL] Index build resource cost at scale
    -----------------------------------------------------------------------------
-   DiskANN graph construction is CPU-intensive. For large embedding tables:
+   Building the DiskANN graph is CPU-heavy. For large embedding tables:
 
      - CPU: you can't throttle it with MAXDOP on SQL Server 2025 (the option
        is ignored, a documented known issue). Use Resource Governor or a
@@ -746,9 +746,9 @@ GO
      - Storage: the graph lands in internal tables (Section 1c). Measure it
        after the build instead of guessing.
 
-   Monitor an in-progress build with sys.dm_exec_requests.
-   Run the query below in a SECOND connection window while CREATE VECTOR INDEX
-   executes in the first window.
+   You can watch an in-progress build with sys.dm_exec_requests. Run the
+   query below in a SECOND connection window while CREATE VECTOR INDEX
+   runs in the first.
 ----------------------------------------------------------------------------- */
 
 -- Window 1 (uncomment to run):
@@ -792,15 +792,15 @@ SELECT
 GO
 
 /* -----------------------------------------------------------------------------
-   4e. [OPTIONAL] EXECUTION PLAN ANATOMY — the Vector Index Seek operator
+   4e. [OPTIONAL] EXECUTION PLAN ANATOMY: the Vector Index Seek operator
    -----------------------------------------------------------------------------
-   Unlike a Clustered Index Scan (full table read) or a B-tree Index Seek
-   (point/range lookup), VECTOR_SEARCH introduces a purpose-built plan operator:
+   VECTOR_SEARCH brings its own plan operator. It isn't a Clustered Index
+   Scan (full table read) or a B-tree Index Seek (point/range lookup). It's:
 
        Vector Index Seek
 
    Read the plan in SSMS (Ctrl+M) or query sys.dm_exec_cached_plans directly.
-   The ANN plan shape is:
+   Here's the ANN plan shape:
 
        Top
         └─ Nested Loops
@@ -809,7 +809,7 @@ GO
             │   └─ Clustered Index Seek  ← QuestionEmbeddings row lookup
             └─ Clustered Index Seek      ← Posts row lookup
 
-   Contrast with the exact kNN plan from Demo 01 Section 5 (no vector index):
+   Compare that to the exact kNN plan from Demo 01 Section 5 (no vector index):
 
        Top N Sort
         └─ Compute Scalar            ← VECTOR_DISTANCE computed for every row
@@ -843,11 +843,11 @@ ORDER BY s.distance;
 GO
 
 -- WHAT TO LOOK FOR in the graphical plan (node numbers match the query below):
---   Node 0   Top                  — enforces the 5-row limit
---   Node 1-2 Nested Loops         — for each ANN result, fetch the rows
---   Node 3   Vector Index Seek    — the graph walk on 'vec_idx', cost ~0.13
---   Node 36  Clustered Index Seek — QuestionEmbeddings lookup
---   Node 37  Clustered Index Seek — Posts lookup
+--   Node 0   Top                    enforces the 5-row limit
+--   Node 1-2 Nested Loops           for each ANN result, fetch the rows
+--   Node 3   Vector Index Seek      the graph walk on 'vec_idx', cost ~0.13
+--   Node 36  Clustered Index Seek   QuestionEmbeddings lookup
+--   Node 37  Clustered Index Seek   Posts lookup
 
 -- Query the plan cache directly to see the operator tree without SSMS:
 SET QUOTED_IDENTIFIER ON;
@@ -886,7 +886,7 @@ GO
    4f. STRESS TEST: the silent zero-results failure
    -----------------------------------------------------------------------------
    This is the most dangerous production pitfall with earlier-version DiskANN.
-   It produces no error — just silently returns zero rows.
+   It produces no error. It just silently returns zero rows.
 
    SETUP: find questions about CSS centering with Score > 5,000. Only 21
    questions in the 10,000-row embedded set have Score > 5,000 at all
@@ -894,7 +894,7 @@ GO
    pass the filter.
 
    STEP 1: ANN with tight TOP_N=5 and a selective Score filter.
-   Expected: 0 rows — all 5 ANN candidates have Score < 5,000.
+   Expected: 0 rows, because all 5 ANN candidates have Score < 5,000.
 ----------------------------------------------------------------------------- */
 DECLARE @search_text   NVARCHAR(MAX) = N'how do I center a div in CSS';
 DECLARE @search_vector VECTOR(768)   = AI_GENERATE_EMBEDDINGS(@search_text USE MODEL ollama);
@@ -914,12 +914,12 @@ ORDER BY s.distance;
 -- Returns 0 rows. No error. Silent data loss.
 GO
 
--- STEP 2: Diagnose — what DID the ANN retrieve before the filter?
--- Remove the WHERE clause to see the raw ANN candidates and their scores.
+-- STEP 2: Diagnose. What DID the ANN retrieve before the filter?
+-- Let's drop the WHERE clause and look at the raw ANN candidates and scores.
 DECLARE @search_text   NVARCHAR(MAX) = N'how do I center a div in CSS';
 DECLARE @search_vector VECTOR(768)   = AI_GENERATE_EMBEDDINGS(@search_text USE MODEL ollama);
 
-PRINT '--- Step 2: Diagnose — ANN TOP_N=5 WITHOUT filter (raw candidates) ---';
+PRINT '--- Step 2: Diagnose: ANN TOP_N=5 WITHOUT filter (raw candidates) ---';
 SELECT t.PostId, p.Score, s.distance
 FROM VECTOR_SEARCH(
     TABLE      = dbo.QuestionEmbeddings AS t,
@@ -931,28 +931,28 @@ FROM VECTOR_SEARCH(
 JOIN dbo.Posts p ON t.PostId = p.Id
 ORDER BY s.distance;
 -- All 5 scores are < 5,000 (this run: 596, 842, 3549, 428, 728).
--- The filter is correct — there just aren't any high-score results in this batch.
+-- The filter's fine. There just aren't any high-score results in this batch.
 GO
 
--- STEP 3: Confirm the data DOES exist — exact kNN finds it.
+-- STEP 3: Confirm the data DOES exist. Exact kNN finds it.
 DECLARE @search_text   NVARCHAR(MAX) = N'how do I center a div in CSS';
 DECLARE @search_vector VECTOR(768)   = AI_GENERATE_EMBEDDINGS(@search_text USE MODEL ollama);
 
-PRINT '--- Step 3: Exact kNN, Score > 5000 (ground truth — proves data exists) ---';
+PRINT '--- Step 3: Exact kNN, Score > 5000 (ground truth: proves data exists) ---';
 SELECT TOP(5) qe.PostId, p.Score,
     VECTOR_DISTANCE('cosine', @search_vector, qe.embeddings) AS distance
 FROM dbo.QuestionEmbeddings qe
 JOIN dbo.Posts p ON qe.PostId = p.Id
 WHERE p.Score > 5000
 ORDER BY distance;
--- Returns 5 rows — highest scored questions nearest to "center a div in CSS".
+-- Returns 5 rows: the highest-scored questions nearest to "center a div in CSS".
 -- This run: 503093, 178325, 348170, 927358, 477816 (Scores 6,591 to 17,388).
--- distance ~0.49–0.57 — much further away than the TOP_N=5 candidates
--- (0.11–0.15). That's WHY the ANN didn't include them: closer but
+-- Notice distance is ~0.49–0.57, much further away than the TOP_N=5
+-- candidates (0.11–0.15). That's WHY the ANN didn't include them: closer,
 -- lower-scored rows fill the top of the list.
 GO
 
--- STEP 4: Fix — oversample TOP_N to cover the filter's selectivity.
+-- STEP 4: Fix it. Oversample TOP_N to cover the filter's selectivity.
 -- 21 of 10,000 embedded questions have Score > 5000 → ~0.21% selectivity.
 -- 1,713 rows are closer to the query than the furthest qualifying result,
 -- so TOP_N has to reach past all of them. TOP_N=2500 returns all 5.
@@ -960,14 +960,14 @@ GO
 DECLARE @search_text   NVARCHAR(MAX) = N'how do I center a div in CSS';
 DECLARE @search_vector VECTOR(768)   = AI_GENERATE_EMBEDDINGS(@search_text USE MODEL ollama);
 
-PRINT '--- Step 4: ANN TOP_N=2500, Score > 5000 (oversampled — correct) ---';
+PRINT '--- Step 4: ANN TOP_N=2500, Score > 5000 (oversampled, correct) ---';
 SELECT TOP(5) t.PostId, p.Score, s.distance
 FROM VECTOR_SEARCH(
     TABLE      = dbo.QuestionEmbeddings AS t,
     COLUMN     = [embeddings],
     SIMILAR_TO = @search_vector,
     METRIC     = 'cosine',
-    TOP_N      = 2500       -- covers ~25% of the corpus; filter has material to work with
+    TOP_N      = 2500       -- covers ~25% of the corpus, so the filter has material to work with
 ) AS s
 JOIN dbo.Posts p ON t.PostId = p.Id
 WHERE p.Score > 5000
@@ -979,7 +979,7 @@ ORDER BY s.distance;
 --   Rule of thumb: TOP_N ≥ K / estimated_filter_pass_rate
 --   For 0.21% selectivity wanting 5 results: TOP_N ≥ 2381 (use 2500).
 --   On Azure SQL DB / Fabric (latest-version DiskANN), iterative filtering
---   eliminates this problem entirely — the engine searches until it finds K
+--   eliminates this problem entirely. The engine searches until it finds K
 --   qualifying rows, regardless of filter selectivity.
 GO
 
@@ -1035,7 +1035,7 @@ GO
 
 
 /* =============================================================================
-   SECTION 5 — LATEST-VERSION DiskANN: WHAT'S NEW (Azure SQL DB / Fabric)
+   SECTION 5. LATEST-VERSION DiskANN: WHAT'S NEW (Azure SQL DB / Fabric)
    =============================================================================
 
    The latest-version DiskANN index is GA on Azure SQL Database, SQL database
@@ -1059,7 +1059,7 @@ GO
 
 
 /* -----------------------------------------------------------------------------
-   5a. Check which DiskANN version you are running
+   5a. Check which DiskANN version you're running
    -----------------------------------------------------------------------------
    The reliable check is the Version key in sys.vector_indexes.build_parameters.
    The docs' own migration guidance uses it: Version = 3 is the latest
@@ -1086,7 +1086,7 @@ GO
 
 
 /* -----------------------------------------------------------------------------
-   5b. [OPTIONAL] Latest-version: new query syntax — SELECT TOP (N) WITH APPROXIMATE
+   5b. [OPTIONAL] Latest-version: new query syntax (SELECT TOP (N) WITH APPROXIMATE)
    -----------------------------------------------------------------------------
    The earlier-version syntax used TOP_N as a VECTOR_SEARCH parameter:
 
@@ -1105,9 +1105,9 @@ GO
            -- no TOP_N parameter
        ) AS s
 
-   WITH APPROXIMATE signals to the optimizer that approximate results are
-   acceptable. The optimizer then decides whether to use the DiskANN index
-   or fall back to exact kNN based on data size, predicates, and cost.
+   WITH APPROXIMATE tells the optimizer approximate results are OK. It then
+   decides whether to use the DiskANN index or fall back to exact kNN based
+   on data size, predicates, and cost.
 
    MIGRATION WARNING: if you create a latest-version index and keep the
    old TOP_N syntax, the query fails with Msg 42274. Update the query
@@ -1196,8 +1196,8 @@ ORDER BY s.distance;
    5 matching rows exist, regardless of filter selectivity.
 ----------------------------------------------------------------------------- */
 
--- Show the current on-prem oversampling workaround in action (Section 4b
--- above). This is the code you would SIMPLIFY when moving to Azure SQL DB.
+-- Here's the on-prem oversampling workaround in action (Section 4b
+-- above). It's the code you'd SIMPLIFY when you move to Azure SQL DB.
 DECLARE @search_text   NVARCHAR(MAX) = N'how do I center a div vertically and horizontally';
 DECLARE @search_vector VECTOR(768)   = AI_GENERATE_EMBEDDINGS(@search_text USE MODEL ollama);
 
@@ -1219,11 +1219,11 @@ WHERE p.Score > 500
 ORDER BY s.distance;
 GO
 -- On Azure SQL DB (latest-version): drop TOP_N = 50, change to
--- SELECT TOP (5) WITH APPROXIMATE — the filter runs inside the walk.
+-- SELECT TOP (5) WITH APPROXIMATE, and the filter runs inside the walk.
 
 
 /* -----------------------------------------------------------------------------
-   5d. [OPTIONAL] sys.dm_db_vector_indexes — background maintenance monitoring
+   5d. [OPTIONAL] sys.dm_db_vector_indexes: background maintenance monitoring
    -----------------------------------------------------------------------------
    In the latest-version, DML is applied asynchronously: your INSERT/UPDATE/
    DELETE commits immediately, and a background task folds the change into
@@ -1268,13 +1268,13 @@ GO
    arrived, it uses the older structure. To get full DML + iterative
    filtering + the new syntax:
 
-     STEP 1 — Update your application queries FIRST.
+     STEP 1:  Update your application queries FIRST.
               Change all VECTOR_SEARCH calls from TOP_N parameter to
               SELECT TOP (N) WITH APPROXIMATE syntax (Section 5b).
               If you migrate the index without updating queries, searches
               fail with Msg 42274.
 
-     STEP 2 — Drop and recreate the index. The CREATE syntax is UNCHANGED.
+     STEP 2:  Drop and recreate the index. The CREATE syntax is UNCHANGED.
 
               DROP INDEX vec_idx ON dbo.QuestionEmbeddings;
 
@@ -1283,7 +1283,7 @@ GO
               WITH (METRIC = 'cosine', TYPE = 'diskann');
               -- That's it. The new index is automatically latest-version.
 
-     STEP 3 — Verify the version (Section 5a).
+     STEP 3:  Verify the version (Section 5a).
 
               SELECT JSON_VALUE(build_parameters, '$.Version')
               FROM sys.vector_indexes;                        -- 3 = latest

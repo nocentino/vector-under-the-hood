@@ -1,15 +1,18 @@
 # SQL Server 2025 Vectors: Under the Hood and Into Production
 
-Conference demo repo for the talk **"SQL Server 2025 Vectors: Under the Hood and Into Production"**.  
-Everything runs locally — SQL Server 2025, Ollama embeddings, and a Python RAG app —
-with a single command. No cloud services, no API keys.
+This repo has every demo from my session **SQL Server 2025 Vectors: Under the Hood and
+Into Production**. Everything runs on your laptop: SQL Server 2025 in Docker, Ollama for
+embeddings and answers, and a small Python RAG app on top. No cloud services, no API keys.
 
-Tested on SQL Server 2025 CU10 (17.0.5035.5) in Docker on an Apple M2 (24 GB) with
-Ollama on the host. Every number quoted in the demo scripts was measured on that setup.
+Clone it, run one script, and you can work through the same demos I show on stage. Let's go.
+
+> I built and tested this on SQL Server 2025 CU10 (17.0.5035.5) in Docker on an Apple M2
+> with 24 GB of RAM, with Ollama running on the host. Every number in the demo scripts
+> came from that setup. Your mileage will certainly vary.
 
 ---
 
-## Abstract
+## About the Session
 
 SQL Server 2025's vector data type puts semantic search and retrieval-augmented
 generation directly into a data estate you already operate and trust. That's a big
@@ -33,284 +36,279 @@ SQL Server applications, this one's for you. Let's go.
 
 ---
 
-## What you need
+## What You'll Need
 
 | Prerequisite | Notes |
 |---|---|
 | **Docker Desktop** | 4.x or later, running |
-| **Ollama** | [ollama.com/download](https://ollama.com/download) — must be installed |
-| **ODBC Driver 18** for SQL Server | Optional: only to run `rag-app.py` on the host. The `rag-app` container includes it |
-| **Python 3.9+** | Optional: only to run `rag-app.py` on the host |
-| ~4 GB free disk space | SQL Server image (~1.7 GB) + StackOverflow backup (~760 MB) |
-| ~2 GB more for `llama3.2` | Used by the RAG app for generation |
-| ~670 MB more for `mxbai-embed-large` | Optional: only for the model swap in Demo 03 §4b (`ollama pull mxbai-embed-large`) |
+| **Ollama** | Installed from [ollama.com/download](https://ollama.com/download). `start.sh` pulls the models for you |
+| **Disk space** | About 4 GB for the SQL Server image and the StackOverflow backup, plus 2 GB for `llama3.2` |
+| **`mxbai-embed-large`** | Optional. Only for the model swap in Demo 03 §4b (`ollama pull mxbai-embed-large`, about 670 MB) |
 
-> **Apple Silicon (M1/M2/M3/M4):** SQL Server 2025 runs as `linux/amd64` under Rosetta.  
-> Docker Desktop's Rosetta emulation must be enabled (Settings → General → Use Rosetta).
+You don't need Python or an ODBC driver on your machine. The RAG app runs in its own container.
+
+> **Apple Silicon:** SQL Server 2025 runs as `linux/amd64` under Rosetta, so turn on
+> Rosetta emulation in Docker Desktop (Settings → General → Use Rosetta).
 
 ---
 
-## Quick start
+## Getting Started
+
+### Step 1: Start the stack
+
+Clone the repo and run the start script:
 
 ```bash
-# 1. Clone / download this repo and cd into it
+git clone https://github.com/nocentino/vector-under-the-hood.git
 cd vector-under-the-hood
-
-# 2. Pull the models and spin up the full stack
 ./start.sh
 ```
 
-`start.sh` will:
-1. Start Ollama (if not already running) and pull `nomic-embed-text` + `llama3.2`
-2. Download the StackOverflow Mini backup (~760 MB, one-time)
-3. `docker compose up --detach` — builds the TLS proxy, starts SQL Server, restores  
-   the database, generates 1,000 embeddings, and builds the DiskANN vector index
+Here's what `start.sh` does for you:
 
-The `sql-init` container runs the full setup and exits with code 0 when everything  
-is ready, or non-zero if any step fails. Watch progress with:
+1. Starts Ollama if it isn't running, and pulls `nomic-embed-text` and `llama3.2`
+2. Downloads the StackOverflow Mini backup (about 760 MB, one time)
+3. Runs `docker compose up`, which starts SQL Server, restores the database, embeds the
+   top 1,000 questions, and builds the DiskANN vector index
+
+The first run takes 10 to 20 minutes. The `sql-init` container does the setup and exits
+when it's done. You can watch it work:
 
 ```bash
 docker logs -f sql-init
-docker compose ps -a sql-init      # STATUS shows "Exited (0)" on success
+docker compose ps -a sql-init      # "Exited (0)" means you're ready
 ```
 
-First run takes **10–20 minutes** (image pulls + embedding 1,000 questions).
+If it exits with anything other than 0, the log tells you which step failed. Running
+`./start.sh` again is safe. It won't redo work that's already finished.
 
-Re-running `./start.sh` is safe. `sql-init` runs again but only fills the table up to
-1,000 rows if it's short, so it never touches an expanded 10,000-row table.
+### Step 2: Grow the data to 10,000 rows
 
----
-
-## Expanding the corpus to 10,000 embeddings (do this before presenting)
-
-The startup script embeds the **top 1,000** questions by community score. The
-numbers in Demo 02 (IO comparison, scale table, the zero-results test in §4f)
-assume **10,000 rows**. At 1,000 rows the vector index actually loses to a full
-scan, so expand first:
+The stack starts with 1,000 embedded questions. That's not enough to see what a vector
+index is good for. At 1,000 rows the index actually loses to a plain table scan, and
+the numbers in Demo 02 assume 10,000 rows. So grow the data:
 
 ```bash
 bash setup/expand-embeddings.sh
 ```
 
-The script drops the vector index, embeds the next highest-scored questions in
-batches of 100, then rebuilds the DiskANN index over all 10,000 rows.
+The script drops the vector index, embeds the next 9,000 highest-scored questions in
+batches of 100, then rebuilds the index. If you stop it partway, run it again and it
+picks up where it left off. If three batches in a row fail, it stops and shows you the
+error. That's usually Ollama not running.
 
-**Timing reference** (Apple Silicon M2, SQL Server 2025 CU10, Ollama on the host):
+Here's how long things took on my M2:
 
-| Phase | Time |
+| Step | Time |
+|---|:---:|
+| Embedding 100 questions | ~20 seconds |
+| Growing to 10,000 rows | ~30 minutes |
+| Building the vector index, 1,000 rows | ~11 seconds |
+| Building the vector index, 10,000 rows | 23 seconds to 2 minutes |
+| First index build after a restart | up to ~6 minutes |
+
+### Step 3: Run the demos
+
+Open the three demo scripts in SSMS or the MSSQL extension for VS Code, connect to
+`localhost,1435` as `sa`, and run them in order. Each script explains what you're
+looking at as you go. Run it a section at a time and read the comments.
+
+---
+
+## The Demos
+
+Each demo lines up with one of the session's learning objectives. Sections marked
+**[OPTIONAL]** in the scripts are deeper dives. Skip them on a first pass and come back
+when you want more detail.
+
+### Demo 01: Vector Internals ([demos/01-vector-internals.sql](demos/01-vector-internals.sql))
+
+How a vector is stored and how SQL Server runs an exact similarity search.
+
+| Section | What you'll see |
 |---|---|
-| Per 100 embeddings | ~20 sec |
-| Full 10,000-row run (90 additional batches) | ~30 minutes |
-| DiskANN index build, 1,000 rows | ~11 seconds |
-| DiskANN index build, 10,000 rows | ~23 seconds to ~2 minutes on a running instance; ~340 seconds right after a restart |
+| 1a | The `VECTOR` type in `sys.types` and `sys.columns` |
+| 1b | `DATALENGTH`: an 8-byte header plus 768 × 4 bytes, so 3,080 bytes per vector |
+| 1c | What your client sees (a JSON array) versus what SQL Server stores (binary) |
+| 1d | [OPTIONAL] Whether vectors stay in the row, proven with allocation units and `DBCC PAGE` |
+| 1e | Half-precision `VECTOR(n, float16)`: 2 bytes per element and a 3,996-dimension ceiling |
+| 2 | [OPTIONAL] Putting vectors on their own filegroup |
+| 3 | `AI_GENERATE_EMBEDDINGS` and the HTTPS round trip to Ollama |
+| 4 | `VECTOR_DISTANCE` with cosine, euclidean, and dot; `VECTOR_NORM` |
+| 5 | The exact kNN execution plan, and why you rank before you join |
 
-The script is resumable — if interrupted, re-run it and it picks up where it
-left off (the `NOT EXISTS` guard skips already-embedded rows). Batches that hit
-the REST timeout (Msg 31629) are retried; if three batches in a row make no
-progress, the script stops and prints the error (usually Ollama isn't running).
+### Demo 02: Index Performance ([demos/02-index-performance.sql](demos/02-index-performance.sql))
+
+What the DiskANN index is, what it costs, and where it helps and where it doesn't.
+
+| Section | What you'll see |
+|---|---|
+| 1 | How DiskANN and its Vamana graph work, the build, and where the graph is stored |
+| 2 | Reads and CPU for an exact scan versus the index, and how each one grows with row count |
+| 3 | Recall: how often the index finds the same answers as an exact search |
+| 4a | The table goes read-only while the index exists (Msg 42231 and 42232) |
+| 4b to 4e | [OPTIONAL] Filtered search, dimension limits, build cost, and the `Vector Index Seek` plan |
+| 4f | A filter that silently returns zero rows, how to spot it, and how to fix it |
+| 4g | The other documented limits: INT clustered key, no temp tables, no partitioning |
+| 5 | The newer DiskANN on Azure SQL Database, Fabric, and Managed Instance |
+
+### Demo 03: Application Architecture ([demos/03-application-architecture.sql](demos/03-application-architecture.sql))
+
+The patterns behind a working RAG app, then the app itself.
+
+| Section | What you'll see |
+|---|---|
+| 1 | A separate embeddings table, and chunking long text with `AI_GENERATE_CHUNKS` |
+| 2 | A search proc that uses the index and falls back to an exact search when it's gone |
+| 3 | A least-privilege login for the app |
+| 4a | Loading new data: drop the index, embed, rebuild, with the app working the whole time |
+| 4b | [OPTIONAL] Moving to a different embedding model side by side |
+| 5 | The full request flow, then the app answering questions |
 
 ---
 
-## Before you present
+## The RAG App
 
-Everything runs much slower right after a restart. Warm it up first:
+The app takes your question, asks SQL Server for the most similar StackOverflow
+questions and their best answers, and hands that context to `llama3.2` to write an
+answer. SQL Server does the embedding and the search. The app never touches a vector.
 
-1. Start Docker Desktop, then `./start.sh`, and wait for `sql1` to be healthy.
-2. Run one throwaway index build (Demo 02 §1b). The first build after a
-   restart took ~340 seconds here; after that, 23 seconds to 2 minutes.
-   The demos rebuild the index twice live (Demo 02 §1b, Demo 03 §4a), so
-   budget about two minutes for each and talk through a diagram while it runs.
-3. Run Demo 02 §2b once so the plans and buffer pool are warm.
-4. Ask the app one question so Ollama loads `llama3.2`:
-   `docker compose run --rm rag-app python demos/rag-app.py "warm up"`
-5. If you'll show Demo 03 §4b, warm `mxbai-embed-large` too. A cold model can
-   exceed SQL Server's REST timeout (Msg 31629):
-   `curl -s http://localhost:11434/api/embed -d '{"model":"mxbai-embed-large","input":"warm up"}' > /dev/null`
-6. Each run of Demo 03 §4a embeds 100 more questions. Use `./stop.sh --wipe`
-   for a clean reset (then re-run the expansion).
-
----
-
-## Stopping / cleaning up
+It runs in a container, so you don't need Python or an ODBC driver on your machine.
+The image builds the first time you run it:
 
 ```bash
-./stop.sh           # stop containers, keep data volume
-./stop.sh --wipe    # stop containers AND delete the sql-data volume (full reset)
-```
-
----
-
-## Connection details
-
-| Setting | Value |
-|---|---|
-| Host | `localhost,1435` |
-| SA password | `S0methingS@Str0ng!` |
-| Database | `StackOverflow` |
-| RAG app login | `rag_app` / `RagP@ss2025!` |
-| Monitor login | `dba_monitor` / `MonitorP@ss123!` |
-
-> Port **1435** is used (not 1433) to avoid conflicts with other local SQL Server instances.
-
-`rag_app` has no `SELECT` on any table. It gets `EXECUTE` on the two search procs
-and on `EXTERNAL MODEL::ollama`, plus `VIEW DEFINITION` on `dbo.QuestionEmbeddings`.
-That last grant is metadata only; without it the proc can't see the vector index
-in `sys.vector_indexes` and silently falls back to a full scan (Demo 03 §2a).
-
----
-
-## Stack architecture
-
-```
-Host (macOS)
-├── Ollama :11434          ← GPU-accelerated embedding + generation
-│
-└── Docker Compose
-    ├── config             one-shot: generates self-signed TLS cert
-    ├── model-web          NGINX :443 → Ollama (TLS required by SQL Server)
-    ├── sql1               SQL Server 2025 :1435→1433 — vectors, DiskANN, RAG procs
-    ├── sql-init           one-shot: restore DB, embed 1,000 questions, build index
-    │                      (run setup/expand-embeddings.sh to grow to 10,000)
-    └── rag-app / rag-app-ui   optional (profile "app"): Python RAG CLI and
-                           Streamlit UI :8501, with the ODBC driver built in
-```
-
-SQL Server's `EXTERNAL MODEL` requires HTTPS. NGINX terminates TLS and reverse-proxies
-to the host's Ollama — that's why the `model-web` service exists.
-
----
-
-## Demos
-
-Run the three demo files **in order** in SSMS or the MSSQL extension for VS Code,
-connected to `localhost,1435` as `sa`.
-
-**Session plan (60 minutes of demos + 15 minutes Q&A):**
-
-| Demo | Time | Abstract objective |
-|---|---|---|
-| 01 Vector internals | 15 min | 1. Describe storage, indexing, and query execution |
-| 02 Index performance | 25 min | 2. Evaluate index performance and limits at scale |
-| 03 Application architecture + app | 20 min | 3. Apply architecture patterns to build a working app |
-
-Sections marked **[OPTIONAL]** in the scripts are deep dives for Q&A.
-
-### Demo 01 — Vector Internals ([demos/01-vector-internals.sql](demos/01-vector-internals.sql))
-
-| Section | Topic |
-|---|---|
-| 1a | `VECTOR` type in `sys.types` and `sys.columns` |
-| 1b | `DATALENGTH` — 8-byte header (observed) + 768 × 4 = 3,080 bytes per float32 vector |
-| 1c | Client representation — JSON array vs internal binary format |
-| 1d | [OPTIONAL] In-row vs row-overflow: allocation units + `DBCC PAGE` |
-| 1e | Half-precision `VECTOR(n, float16)` — 2 bytes/element, 3,996-dim ceiling |
-| 2 | [OPTIONAL] Filegroups and data files — `EMBEDDINGS` filegroup isolation |
-| 3 | `AI_GENERATE_EMBEDDINGS` — timing, the HTTP round-trip |
-| 4 | `VECTOR_DISTANCE` metrics — cosine / euclidean / dot; `VECTOR_NORM` |
-| 5 | Exact kNN execution plan — rank in the satellite table, then join |
-
-### Demo 02 — Index Performance ([demos/02-index-performance.sql](demos/02-index-performance.sql))
-
-| Section | Topic |
-|---|---|
-| 1 | DiskANN / Vamana, build time, `build_parameters`, the graph's internal tables |
-| 2 | IO comparison (`SET STATISTICS IO`) and a scale measurement, kNN vs ANN |
-| 3 | Recall@K — ANN vs exact kNN overlap |
-| 4a | Limitation: read-only table (Msg 42231 / 42232) |
-| 4b–4e | [OPTIONAL] Filtered search, dimensions, build cost, `Vector Index Seek` plan |
-| 4f | Silent zero-results with filters, diagnosis, and the oversampling fix |
-| 4g | The other documented limits: INT clustered PK, no temp tables, no partitioning |
-| 5 | Latest-version DiskANN on Azure SQL DB / Fabric / MI — version check and migration |
-
-### Demo 03 — Application Architecture ([demos/03-application-architecture.sql](demos/03-application-architecture.sql))
-
-| Section | Topic |
-|---|---|
-| 1 | Satellite table design; chunking long text with `AI_GENERATE_CHUNKS` |
-| 2 | `dbo.find_similar_questions` — ANN with a kNN fallback; `dbo.get_top_answer` |
-| 3 | Security — `rag_app` least-privilege login |
-| 4a | Drop → embed → rebuild cycle, with the proc switching paths live |
-| 4b | [OPTIONAL] Side-by-side model swap with a second Ollama model |
-| 5 | The full RAG call sequence, then the Python app |
-
----
-
-## Python RAG app
-
-The app runs in a container (`dockerfile.app`), so the host doesn't need an ODBC
-driver. The image builds the first time you run it.
-
-```bash
-# Single question via CLI
+# Ask one question
 docker compose run --rm rag-app python demos/rag-app.py "how do I undo my last git commit?"
 
-# Interactive REPL
+# Ask as many as you like
 docker compose run --rm rag-app python demos/rag-app.py
 
-# Streamlit UI at http://localhost:8501
+# Or use the web UI at http://localhost:8501
 docker compose --profile app up rag-app-ui
 ```
 
-To run it on the host instead, install the ODBC driver and `pip install -r requirements.txt`,
-then `python demos/rag-app.py`. On macOS, Microsoft's ODBC driver loads OpenSSL 3 from
-`/opt/homebrew/opt/openssl`; if that link points at OpenSSL 4, connections fail with
-"OpenSSL library could not be loaded". The container avoids this.
+The first answer can take a minute while Ollama loads `llama3.2`. After that it's faster.
+The app also tells you whether SQL Server answered from the vector index (`ANN`) or
+with an exact search (`kNN`).
 
-The first answer can take a minute or more while Ollama loads `llama3.2`.
-
-The app connects as `rag_app` to `localhost,1435`, calls `dbo.find_similar_questions`
-for retrieval (DiskANN via `VECTOR_SEARCH`, or exact kNN while the index is being
-rebuilt), then calls Ollama `llama3.2` directly for answer generation. It prints which
-search path served each question.
+> Want to run it straight on your Mac instead? Install the ODBC driver and
+> `pip install -r requirements.txt`. On macOS, Microsoft's ODBC driver needs OpenSSL 3
+> at `/opt/homebrew/opt/openssl`, and if that points at OpenSSL 4 you'll get "OpenSSL
+> library could not be loaded". The container sidesteps all of that.
 
 ---
 
-## Changing embedding models
+## Trying a Different Embedding Model
 
-1. Pull a different model in Ollama: `ollama pull mxbai-embed-large`
-2. Follow Demo 03 Section 4b: register it as a second `EXTERNAL MODEL`, build a
-   second embeddings table with the new `VECTOR(n)`, then repoint the proc
+The stack uses `nomic-embed-text`, which produces 768-dimension vectors. Demo 03 §4b
+walks you through moving to `mxbai-embed-large` (1,024 dimensions) side by side,
+without taking the app down:
+
+1. Pull the model: `ollama pull mxbai-embed-large`
+2. Register it as a second `EXTERNAL MODEL`
+3. Build a second embeddings table with `VECTOR(1024)` and its own index
+4. Point the search proc at the new table
 
 ---
 
-## Key SQL Server 2025 features used
+## Connection Details
 
-| Feature | Demo |
+| Setting | Value |
 |---|---|
-| `VECTOR(n)` data type (float32) | 01, 02, 03 |
-| `VECTOR(n, float16)` half-precision (preview) | 01 §1e |
-| `AI_GENERATE_EMBEDDINGS` | 01 §3, 03 |
-| `AI_GENERATE_CHUNKS` | 03 §1c |
-| `VECTOR_DISTANCE` / `VECTOR_NORM` | 01 §4 |
-| `CREATE VECTOR INDEX` (DiskANN, preview) | 02 §1 |
-| `VECTOR_SEARCH` | 02 §2, 03 §2 |
-| `SELECT TOP N WITH APPROXIMATE`, `sys.dm_db_vector_indexes` | 02 §5 (Azure only, shown not run) |
-| `EXTERNAL MODEL` (Ollama via HTTPS) | 01 §3, 03 |
+| Server | `localhost,1435` |
+| SA password | `S0methingS@Str0ng!` |
+| Database | `StackOverflow` |
+| App login | `rag_app` / `RagP@ss2025!` |
+| Monitoring login | `dba_monitor` / `MonitorP@ss123!` |
+
+The stack uses port 1435 so it won't collide with a SQL Server you already have on 1433.
+These passwords are for a local demo only. Don't reuse them anywhere real.
+
+The app login can't read any table directly. It can run the two search procs and use
+the embedding model, and it has `VIEW DEFINITION` on the embeddings table. That last
+one is metadata only, and the search proc needs it to see the vector index. Demo 03
+shows why.
+
+---
+
+## How It Fits Together
+
+```
+Your Mac
+├── Ollama :11434          embeddings and answers, on your GPU
+│
+└── Docker Compose
+    ├── config             one time: creates a self-signed TLS certificate
+    ├── model-web          NGINX :443, forwards to Ollama over HTTPS
+    ├── sql1               SQL Server 2025 on :1435, with the data, index, and procs
+    ├── sql-init           one time: restores the database and sets everything up
+    └── rag-app / rag-app-ui   optional: the RAG app and its web UI on :8501
+```
+
+SQL Server only calls embedding endpoints over HTTPS. Ollama speaks plain HTTP, so
+NGINX sits in between and adds the TLS. That's the only reason `model-web` exists.
+
+---
+
+## SQL Server 2025 Features in These Demos
+
+| Feature | Where |
+|---|---|
+| `VECTOR(n)` data type | All three demos |
+| `VECTOR(n, float16)` half precision (preview) | Demo 01 §1e |
+| `AI_GENERATE_EMBEDDINGS` | Demo 01 §3, Demo 03 |
+| `AI_GENERATE_CHUNKS` | Demo 03 §1c |
+| `VECTOR_DISTANCE` and `VECTOR_NORM` | Demo 01 §4 |
+| `CREATE VECTOR INDEX` (DiskANN, preview) | Demo 02 §1 |
+| `VECTOR_SEARCH` | Demo 02 §2, Demo 03 §2 |
+| `CREATE EXTERNAL MODEL` with Ollama | Demo 01 §3, Demo 03 |
+| `SELECT TOP (N) WITH APPROXIMATE`, `sys.dm_db_vector_indexes` | Demo 02 §5, shown for Azure only |
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Cause and fix |
+Here are the problems I hit while building this, and what fixes them.
+
+| What you see | What's going on |
 |---|---|
-| Msg 31629 "external rest endpoint execution exceeded the timeout" | The Ollama model is cold or Ollama isn't running. Warm it with a `curl` to `/api/embed` (see *Before you present*) and retry. |
-| Msg 42231 / 42232 on INSERT, UPDATE, DELETE, or TRUNCATE | Expected on SQL Server 2025: the table is read-only while a vector index exists. Drop the index, load, rebuild (Demo 03 §4a). |
-| Msg 42227 "Cannot find a vector index" | `VECTOR_SEARCH` needs an index on SQL Server 2025, and `CREATE PROCEDURE` with `VECTOR_SEARCH` fails if the index doesn't exist yet. Rebuild the index first. |
-| The app always reports `kNN` | `rag_app` is missing `VIEW DEFINITION` on `dbo.QuestionEmbeddings`, or the index is dropped. |
-| `sql-init` exited non-zero | Read `docker logs sql-init`. Usually Ollama isn't reachable from the container (`OLLAMA_HOST=0.0.0.0`). |
-| SSMS: "'Vector Index Seek' is not a valid value for PhysicalOpType" | Your SSMS predates the operator. Update SSMS, or use the plan cache query in Demo 02 §4e. |
-| Host Python: "OpenSSL library could not be loaded" | Run the app in the `rag-app` container instead (see *Python RAG app*). |
-| Everything is slow right after Docker restarts | Expected. Follow *Before you present* to warm up. |
+| **Msg 31629**, "external rest endpoint execution exceeded the timeout" | Ollama isn't running, or the model is still loading. Warm it up with `curl -s http://localhost:11434/api/embed -d '{"model":"nomic-embed-text","input":"hi"}'` and try again. |
+| **Msg 42231 or 42232** on INSERT, UPDATE, DELETE, or TRUNCATE | That's expected. On SQL Server 2025 a table is read-only while it has a vector index. Drop the index, load your data, rebuild it. Demo 03 §4a shows how. |
+| **Msg 42227**, "Cannot find a vector index" | `VECTOR_SEARCH` needs a vector index on SQL Server 2025. Rebuild the index. |
+| The app always says `kNN` | The vector index is missing, or the app login lost `VIEW DEFINITION` on `dbo.QuestionEmbeddings`. |
+| `sql-init` exited with a non-zero code | Check `docker logs sql-init`. It's usually Ollama not being reachable from Docker. |
+| SSMS says "'Vector Index Seek' is not a valid value for PhysicalOpType" | Your SSMS is older than the operator. Update it, or use the plan cache query in Demo 02 §4e. |
+| Everything is slow right after Docker restarts | Nothing is cached yet. The first index build after a restart took me up to 6 minutes. Run it once and it settles down. |
 
 ---
 
-## Repo layout
+## Stopping and Cleaning Up
+
+```bash
+./stop.sh           # stop the containers, keep the data
+./stop.sh --wipe    # stop the containers and delete the data volume
+```
+
+Demo 03 §4a embeds 100 more questions every time you run it. If you want to start
+fresh, run `./stop.sh --wipe`, then `./start.sh` and `bash setup/expand-embeddings.sh`.
+
+---
+
+## What's in the Repo
 
 ```
-demos/        01-03 demo scripts, rag-app.py (CLI), rag-app-ui.py (Streamlit)
-setup/        init.sql (run by sql-init), expand-embeddings.sh
+demos/        the three demo scripts, rag-app.py (CLI), and rag-app-ui.py (web UI)
+setup/        init.sql (run by sql-init) and expand-embeddings.sh
 config/       nginx.conf for the TLS proxy
-certs/        generate_ssl.sh; the cert and key are generated on first start
-backups/      StackOverflowMini.bak (downloaded by start.sh, git-ignored)
+certs/        generate_ssl.sh; the certificate is created on first start
+backups/      StackOverflowMini.bak, downloaded by start.sh and not in git
 docker-compose.yml, dockerfile.ssl, dockerfile.app, start.sh, stop.sh
 ```
+
+---
+
+## Wrapping Up
+
+Everything in this repo runs on SQL Server 2025 and a laptop. Clone it, work through
+the demos, change the queries, and try it with your own data. Let me know how it works
+in your environment.

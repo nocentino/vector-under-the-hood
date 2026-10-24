@@ -6,13 +6,13 @@ GO
 =============================================================================
   SQL Server 2025 Vectors: Under the Hood and Into Production
 
-  setup/init.sql — one-shot idempotent database initialization
+  setup/init.sql: one-shot, idempotent database setup
 =============================================================================
 
-  Run automatically by the sql-init container on first stack start.
-  Safe to re-run: every block is guarded by an existence check.
+  The sql-init container runs this for you on the first stack start.
+  It's safe to re-run. Every block checks whether its object already exists.
 
-  What this script does:
+  Here's what it does:
     0. Enable outbound HTTPS (external REST endpoint)
     1. Restore the StackOverflowMini database
     2. Register the Ollama embedding model as an EXTERNAL MODEL
@@ -24,18 +24,18 @@ GO
     8. Create least-privilege logins for the demo SQL client + rag-app.py
 
   The demo SQL files (01/02/03) walk through this state live.
-  DO NOT alter the objects created here during a live demo — the demo files
-  assume this baseline exists. Use ./stop.sh --wipe to reset completely.
+  DON'T alter these objects during a live demo. The demo files assume this
+  baseline exists. Use ./stop.sh --wipe if you want a full reset.
 =============================================================================
 */
 
 
 /* =============================================================================
-   STEP 0 — Enable outbound HTTPS
+   STEP 0: Enable outbound HTTPS
    ============================================================================= */
 
 -- SQL Server 2025 can make outbound REST calls to external AI endpoints.
--- This server-level switch must be ON before CREATE EXTERNAL MODEL works.
+-- You have to turn this server-level switch ON before CREATE EXTERNAL MODEL works.
 EXEC sp_configure 'external rest endpoint enabled', 1;
 GO
 RECONFIGURE WITH OVERRIDE;
@@ -43,13 +43,13 @@ GO
 
 
 /* =============================================================================
-   STEP 1 — Restore the StackOverflow database
+   STEP 1: Restore the StackOverflow database
    ============================================================================= */
 
 USE [master];
 GO
 
--- Skip the restore if the database already exists (idempotent on re-run).
+-- If the database is already there, skip the restore (idempotent on re-run).
 IF DB_ID('StackOverflow') IS NULL
 BEGIN
     PRINT 'Restoring StackOverflowMini database...';
@@ -64,27 +64,27 @@ BEGIN
     PRINT 'Restore complete.';
 END
 ELSE
-    PRINT 'StackOverflow database already exists — skipping restore.';
+    PRINT 'StackOverflow database already exists, skipping restore.';
 GO
 
--- The backup restores at an older compatibility level. AI_GENERATE_CHUNKS
+-- The backup comes back at an older compatibility level, and AI_GENERATE_CHUNKS
 -- (Demo 03) needs 170 or higher.
 ALTER DATABASE [StackOverflow] SET COMPATIBILITY_LEVEL = 170;
 GO
 
 
 /* =============================================================================
-   STEP 2 — Register the Ollama embedding model
+   STEP 2: Register the Ollama embedding model
    ============================================================================= */
 
 USE [StackOverflow];
 GO
 
 -- CREATE EXTERNAL MODEL is a named pointer to the embedding endpoint.
--- LOCATION is the NGINX TLS reverse proxy (model-web:443) that sits in
--- front of host Ollama. SQL Server 2025 requires HTTPS for external calls.
--- Point this object at a different Ollama model to change models without
--- touching any query in the demo files (see Demo 03 Section 4b).
+-- LOCATION is the NGINX TLS reverse proxy (model-web:443) in front of host
+-- Ollama, because SQL Server 2025 requires HTTPS for external calls.
+-- Point this object at a different Ollama model and you've changed models
+-- without touching a single query in the demo files (see Demo 03 Section 4b).
 IF NOT EXISTS (SELECT 1 FROM sys.external_models WHERE name = N'ollama')
 BEGIN
     PRINT 'Creating EXTERNAL MODEL ollama...';
@@ -98,11 +98,11 @@ BEGIN
     PRINT 'EXTERNAL MODEL created.';
 END
 ELSE
-    PRINT 'EXTERNAL MODEL ollama already exists — skipping.';
+    PRINT 'EXTERNAL MODEL ollama already exists, skipping.';
 GO
 
--- Quick connectivity check: if this SELECT errors, NGINX or Ollama is not
--- reachable. The sql-init container logs the error and exits non-zero.
+-- Quick connectivity check. If this SELECT errors, NGINX or Ollama isn't
+-- reachable, and the sql-init container logs the error and exits non-zero.
 PRINT 'Testing embedding endpoint connectivity...';
 SELECT AI_GENERATE_EMBEDDINGS(N'connectivity test' USE MODEL ollama) AS test_vector;
 PRINT 'Embedding endpoint reachable.';
@@ -110,12 +110,12 @@ GO
 
 
 /* =============================================================================
-   STEP 3 — EMBEDDINGS filegroup and data file
+   STEP 3: EMBEDDINGS filegroup and data file
    ============================================================================= */
 
--- The QuestionEmbeddings table lives on its own filegroup backed by a
--- dedicated .ndf file. This separates vector I/O (large, sequential during
--- index build and graph traversal) from operational OLTP I/O on PRIMARY.
+-- QuestionEmbeddings gets its own filegroup and its own .ndf file. That keeps
+-- vector I/O (large, sequential during index build and graph traversal) apart
+-- from the OLTP I/O on PRIMARY.
 IF NOT EXISTS (SELECT 1 FROM sys.filegroups WHERE name = N'EMBEDDINGS')
 BEGIN
     PRINT 'Adding EMBEDDINGS filegroup...';
@@ -138,13 +138,13 @@ GO
 
 
 /* =============================================================================
-   STEP 4 — QuestionEmbeddings satellite table
+   STEP 4: QuestionEmbeddings satellite table
    ============================================================================= */
 
--- VECTOR(768) is a first-class column type — not a string, not JSON.
--- chunk stores the exact text that was embedded so we can return it as
--- RAG context without re-joining to Posts at retrieval time.
--- The table is stored on the EMBEDDINGS filegroup (separate from Posts).
+-- VECTOR(768) is a real column type. It's not a string and it's not JSON.
+-- chunk holds the exact text we embedded, so you can return it as RAG
+-- context without joining back to Posts at retrieval time.
+-- The table lives on the EMBEDDINGS filegroup, apart from Posts.
 IF OBJECT_ID('dbo.QuestionEmbeddings', 'U') IS NULL
 BEGIN
     PRINT 'Creating dbo.QuestionEmbeddings table...';
@@ -160,19 +160,19 @@ GO
 
 
 /* =============================================================================
-   STEP 5 — Generate embeddings (incremental — skips already-embedded rows)
+   STEP 5: Generate embeddings (incremental, skips rows already embedded)
    ============================================================================= */
 
--- Enable preview features so the CREATE VECTOR INDEX in Step 6 succeeds.
+-- Turn on preview features so the CREATE VECTOR INDEX in Step 6 works.
 ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;
 GO
 
--- Embed the top 1,000 questions by community score. Each row's chunk is
--- the question title concatenated with its cleaned tag string — the text
--- that the embedding model turns into a 768-dimensional vector.
+-- Embed the top 1,000 questions by community score. Each chunk is the
+-- question title plus its cleaned tag string. That's the text the embedding
+-- model turns into a 768-dimensional vector.
 --
 -- Every ./start.sh reruns this script, so this step only tops the table up
--- to 1,000 rows, and only while there's no vector index (the table is
+-- to 1,000 rows, and only when there's no vector index (the table is
 -- READ-ONLY while one exists). After expand-embeddings.sh it does nothing.
 -- The INSERT is dynamic SQL because Msg 42231 fires at compile time, even
 -- inside an IF branch that never runs.
@@ -212,12 +212,12 @@ GO
 
 
 /* =============================================================================
-   STEP 6 — Build the DiskANN vector index
+   STEP 6: Build the DiskANN vector index
    ============================================================================= */
 
--- The index enables Approximate Nearest Neighbor (ANN) search via
+-- This index is what gives you Approximate Nearest Neighbor (ANN) search via
 -- VECTOR_SEARCH. Demo 02 compares ANN vs. exact kNN IO stats and recall.
--- MAXDOP is left off: SQL Server 2025 ignores it for vector index builds
+-- There's no MAXDOP here: SQL Server 2025 ignores it for vector index builds
 -- (documented known issue).
 IF NOT EXISTS (
     SELECT 1 FROM sys.indexes
@@ -231,16 +231,16 @@ BEGIN
     PRINT 'Vector index built.';
 END
 ELSE
-    PRINT 'Vector index vec_idx already exists — skipping.';
+    PRINT 'Vector index vec_idx already exists, skipping.';
 GO
 
 
 /* =============================================================================
-   STEP 7a — Application views
+   STEP 7a: Application views
    ============================================================================= */
 
--- A tidy, agent-friendly view over Questions. Only useful columns;
--- tags are cleaned from <tag1><tag2> XML form to "tag1, tag2" text.
+-- A tidy, agent-friendly view over Questions with just the useful columns.
+-- Tags get cleaned up from <tag1><tag2> XML form to "tag1, tag2" text.
 CREATE OR ALTER VIEW dbo.vQuestions AS
 SELECT
     p.Id,
@@ -257,14 +257,14 @@ GO
 
 
 /* =============================================================================
-   STEP 7b — Semantic search stored procedure
+   STEP 7b: Semantic search stored procedure
    ============================================================================= */
 
--- Primary retrieval procedure used by rag-app.py and Demo 03.
--- Accepts plain text; SQL Server handles embedding via AI_GENERATE_EMBEDDINGS.
--- Returns only scalar columns (no VECTOR type) — clean for application use.
--- Uses the DiskANN index when it exists and falls back to exact kNN while the
--- index is dropped for maintenance. Must be created while vec_idx exists:
+-- The main retrieval procedure for rag-app.py and Demo 03.
+-- You pass in plain text and SQL Server embeds it via AI_GENERATE_EMBEDDINGS.
+-- It returns only scalar columns (no VECTOR type), so the app gets clean rows.
+-- It uses the DiskANN index when it exists and falls back to exact kNN while
+-- the index is dropped for maintenance. Create it while vec_idx exists, since
 -- CREATE PROCEDURE fails with Msg 42227 if VECTOR_SEARCH has no index.
 CREATE OR ALTER PROCEDURE dbo.find_similar_questions
     @prompt NVARCHAR(MAX),
@@ -325,12 +325,12 @@ GO
 
 
 /* =============================================================================
-   STEP 7c — Top-answer retrieval stored procedure
+   STEP 7c: Top-answer retrieval stored procedure
    ============================================================================= */
 
--- Returns the accepted answer (preferred) or highest-scored answer for a
--- given question. Called by rag-app.py after find_similar_questions to
--- populate the RAG context with actual answer text.
+-- Returns the accepted answer (if there is one) or the highest-scored answer
+-- for a question. rag-app.py calls it after find_similar_questions so the RAG
+-- context has real answer text in it.
 CREATE OR ALTER PROCEDURE dbo.get_top_answer
     @question_post_id INT
 AS
@@ -355,16 +355,16 @@ GO
 
 
 /* =============================================================================
-   STEP 8 — Least-privilege logins
+   STEP 8: Least-privilege logins
    ============================================================================= */
 
 USE [master];
 GO
 
 -- ── rag_app: the Python RAG application login ─────────────────────────────
--- Used by rag-app.py. Can only EXECUTE the two search procedures and the
--- external model (needed for AI_GENERATE_EMBEDDINGS inside the procs).
--- Cannot SELECT any table directly, cannot INSERT/UPDATE/DELETE anything.
+-- rag-app.py connects as this login. It can only EXECUTE the two search
+-- procedures and the external model (AI_GENERATE_EMBEDDINGS inside the procs
+-- needs that). It can't SELECT any table directly or INSERT/UPDATE/DELETE anything.
 IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'rag_app')
     CREATE LOGIN rag_app
     WITH PASSWORD        = 'RagP@ss2025!',
@@ -387,8 +387,8 @@ USE [master];
 GO
 
 -- ── dba_monitor: read-only monitoring login ───────────────────────────────
--- Grants VIEW SERVER STATE for DMV queries.
--- Included so Demo 02's index build monitoring queries run under this login.
+-- Gets VIEW SERVER STATE for DMV queries.
+-- It's here so you can run Demo 02's index build monitoring queries as this login.
 IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'dba_monitor')
     CREATE LOGIN dba_monitor
     WITH PASSWORD        = 'MonitorP@ss123!',

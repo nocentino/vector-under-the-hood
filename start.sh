@@ -10,16 +10,16 @@ LLM_MODEL="llama3.2"
 # ── Host Ollama ───────────────────────────────────────────────────────────────
 # Ollama runs on the HOST (GPU-accelerated). NGINX in the stack reverse-proxies
 # to it at host.docker.internal:11434 and adds the TLS that SQL Server 2025's
-# EXTERNAL MODEL requires.
+# EXTERNAL MODEL needs.
 if command -v ollama >/dev/null 2>&1; then
-    # Start the server if it isn't already responding.
+    # Start the server if it's not already answering.
     if ! ollama list >/dev/null 2>&1; then
         echo "Ollama is installed but the server is not running. Starting it..."
         # OLLAMA_NUM_GPU=999  → use all available GPU layers (Metal on Apple Silicon,
-        #                        CUDA on NVIDIA). Default on macOS is already GPU, but
-        #                        being explicit ensures no CPU-only fallback.
+        #                        CUDA on NVIDIA). macOS already defaults to GPU, but
+        #                        being explicit means no CPU-only fallback.
         OLLAMA_NUM_GPU=999 OLLAMA_HOST=0.0.0.0 ollama serve >/tmp/ollama-serve.log 2>&1 &
-        # Give the server up to 10s to become responsive.
+        # Give the server up to 10s to respond.
         for i in $(seq 1 10); do
             sleep 1
             ollama list >/dev/null 2>&1 && break
@@ -27,7 +27,7 @@ if command -v ollama >/dev/null 2>&1; then
         done
     fi
 
-    # Report which hardware Ollama is using for loaded models:
+    # Show which hardware Ollama is using for loaded models:
     echo "Ollama GPU status:"
     ollama ps 2>/dev/null || true
 
@@ -37,7 +37,7 @@ if command -v ollama >/dev/null 2>&1; then
     fi
     echo "Host Ollama ready ($EMBED_MODEL present)."
 
-    # Pull the generation model for rag-app.py if it's not already present.
+    # Pull the generation model for rag-app.py if you don't have it yet.
     if ! ollama list 2>/dev/null | grep -q "$LLM_MODEL"; then
         echo "Pulling $LLM_MODEL for rag-app.py (one time)..."
         ollama pull "$LLM_MODEL"
@@ -49,14 +49,14 @@ else
     echo "    ollama pull $LLM_MODEL     # generation model for rag-app.py"
 fi
 
-# If containers can't reach host Ollama (non-Docker Desktop runtimes like
+# If your containers can't reach host Ollama (non-Docker Desktop runtimes like
 # OrbStack or plain Linux), make Ollama listen on all interfaces:
 #     launchctl setenv OLLAMA_HOST "0.0.0.0"   # then restart Ollama
-# Docker Desktop reaches the host's localhost via host.docker.internal already.
+# Docker Desktop already reaches the host's localhost via host.docker.internal.
 
 # ── StackOverflow sample database ────────────────────────────────────────────
-# ~759 MB — too big to commit to git. Downloaded once to backups/ and reused.
-# Runs on the HOST so corporate TLS inspection (Zscaler etc.) doesn't interfere.
+# ~759 MB, too big to commit to git. It's downloaded once to backups/ and reused.
+# The download runs on the HOST so corporate TLS inspection (Zscaler etc.) doesn't get in the way.
 BAK="backups/StackOverflowMini.bak"
 BAK_URL="https://github.com/BrentOzarULTD/Stack-Overflow-Database/releases/download/20230114/StackOverflowMini.bak"
 if [ ! -f "$BAK" ]; then
