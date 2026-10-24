@@ -9,6 +9,30 @@ Ollama on the host. Every number quoted in the demo scripts was measured on that
 
 ---
 
+## Abstract
+
+SQL Server 2025's vector data type puts semantic search and retrieval-augmented
+generation directly into a data estate you already operate and trust. That's a big
+deal, and there's real engineering depth that is worth understanding before you ship
+anything to production.
+
+This session goes inside the vector data type: storage layout, index structures, and
+what actually happens at query execution time when you ask SQL Server to perform a
+similarity search. We'll be direct about where vector indexes help and where they don't.
+
+Then we'll zoom out and build a working example application that puts all of it
+together. If you're an architect, DBA, or developer building the next generation of
+SQL Server applications, this one's for you. Let's go.
+
+**You'll leave able to:**
+
+1. Describe vector data type internals: storage, indexing, and query execution
+2. Evaluate vector index performance and limitations at scale
+3. Apply application architecture patterns to build a working application using
+   SQL Server 2025's vector search capabilities
+
+---
+
 ## What you need
 
 | Prerequisite | Notes |
