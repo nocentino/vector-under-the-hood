@@ -26,9 +26,13 @@ GO
 
   Run sections top-to-bottom. Every section is idempotent.
 
-  LIVE-DEMO TIP: Section 2 (the procs) is the most hands-on part — run the
-    test EXEC calls live. Section 3 (security) is the "trust" argument for
-    architects and DBAs. Budget roughly 10–12 min per section.
+  TIME BUDGET: 20 minutes of a 60-minute session.
+    1   schema + chunking          4 min
+    2   RAG procs                  5 min
+    3   security                   3 min
+    4a  maintenance cycle          4 min
+    5   run the app                4 min
+    [OPTIONAL] 4b model swap (needs a second Ollama model pulled).
 =============================================================================
 */
 
@@ -57,12 +61,18 @@ GO
 
      REBUILD INDEPENDENCE
        When you change models (e.g., upgrade from nomic-embed-text 768-dim to
-       mxbai-embed-large 1024-dim), you TRUNCATE and rebuild QuestionEmbeddings
-       without touching Posts. The PostId foreign key keeps them aligned.
+       mxbai-embed-large 1024-dim), you rebuild the embeddings table without
+       touching Posts. PostId keeps them aligned. There's no foreign key in
+       this demo; add one in production.
+
+     INDEX REQUIREMENTS
+       A vector index needs a clustered primary key on a single INT column
+       (Msg 42217 otherwise). Posts may not fit that rule. A satellite table
+       lets you design the key for the index.
 
      PARTIAL COVERAGE
-       Not every Post needs an embedding. We embedded the top 10,000
-       questions by Score. The satellite table naturally represents this
+       Not every Post needs an embedding. We embedded the top questions
+       by Score. The satellite table naturally represents this
        partial coverage: a missing row means "not yet embedded," not NULL data.
 
      STORAGE TIERING
@@ -118,11 +128,10 @@ GO
        "This is the exact text the vector represents." Useful for debugging
        retrieval quality when results look wrong.
 
-   In a production chunking pipeline, chunk would contain a sliding window of
-   document text (e.g., 512 tokens with 64-token overlap). Here it is the
-   question title concatenated with the cleaned tag string.
+   Our chunks are short (a title plus tags), so one row is one chunk. Real
+   documents are longer than an embedding model wants to see at once, so
+   you split them. SQL Server 2025 does that in T-SQL with AI_GENERATE_CHUNKS.
 ----------------------------------------------------------------------------- */
---TODO: Add an example of chunking
 
 SELECT TOP (5)
     qe.PostId,
@@ -131,6 +140,66 @@ SELECT TOP (5)
     qe.embeddings           AS embedding_preview
 FROM dbo.QuestionEmbeddings qe;
 GO
+
+
+/* -----------------------------------------------------------------------------
+   1c. Chunking long text with AI_GENERATE_CHUNKS
+   -----------------------------------------------------------------------------
+   Answers are long HTML bodies. Let's chunk the accepted answers to a few
+   top questions into 500-character pieces with 10% overlap, then embed each
+   piece. The overlap keeps a sentence that straddles a boundary in both
+   chunks.
+
+   Two schema points:
+     - ChunkId is a surrogate INT key. (AnswerId, chunk_order) is the natural
+       key, but a vector index needs a single INT clustered primary key.
+     - AI_GENERATE_CHUNKS needs database compatibility level 170
+       (setup/init.sql sets it).
+
+   Docs: https://learn.microsoft.com/en-us/sql/t-sql/functions/ai-generate-chunks-transact-sql
+----------------------------------------------------------------------------- */
+
+DROP TABLE IF EXISTS dbo.AnswerChunks;
+CREATE TABLE dbo.AnswerChunks
+(
+    ChunkId     INT IDENTITY(1,1) NOT NULL,
+    AnswerId    INT               NOT NULL,
+    chunk_order BIGINT            NOT NULL,
+    chunk       NVARCHAR(MAX)     NOT NULL,
+    embeddings  VECTOR(768)       NOT NULL,
+    CONSTRAINT PK_AnswerChunks PRIMARY KEY CLUSTERED (ChunkId)
+) ON [EMBEDDINGS];
+GO
+
+-- What the chunker produces for one answer:
+SELECT TOP (1) a.Id AS answer_id, c.chunk_order, c.chunk_offset, c.chunk_length, c.chunk
+FROM dbo.Posts q
+JOIN dbo.Posts a ON a.Id = q.AcceptedAnswerId
+CROSS APPLY AI_GENERATE_CHUNKS(SOURCE = a.Body, CHUNK_TYPE = FIXED,
+                               CHUNK_SIZE = 500, OVERLAP = 10) AS c
+WHERE q.Id = (SELECT TOP (1) PostId FROM dbo.QuestionEmbeddings ORDER BY PostId)
+ORDER BY c.chunk_order;
+GO
+
+-- Chunk and embed the accepted answers for 5 top questions in one statement:
+INSERT INTO dbo.AnswerChunks (AnswerId, chunk_order, chunk, embeddings)
+SELECT a.Id, c.chunk_order, c.chunk,
+       AI_GENERATE_EMBEDDINGS(c.chunk USE MODEL ollama)
+FROM (SELECT TOP (5) q.AcceptedAnswerId
+      FROM dbo.Posts q
+      JOIN dbo.QuestionEmbeddings qe ON qe.PostId = q.Id
+      WHERE q.AcceptedAnswerId IS NOT NULL
+      ORDER BY q.Score DESC) AS top_q
+JOIN dbo.Posts a ON a.Id = top_q.AcceptedAnswerId
+CROSS APPLY AI_GENERATE_CHUNKS(SOURCE = a.Body, CHUNK_TYPE = FIXED,
+                               CHUNK_SIZE = 500, OVERLAP = 10) AS c;
+GO
+
+SELECT AnswerId, COUNT(*) AS chunks, SUM(LEN(chunk)) AS total_chars
+FROM dbo.AnswerChunks
+GROUP BY AnswerId;
+GO
+-- In production, strip the HTML before chunking. The model embeds the tags too.
 
 
 /* =============================================================================
@@ -145,8 +214,9 @@ GO
    Benefits of this pattern:
 
      SWAPPABLE INTERNALS
-       Move from exact kNN to ANN by changing the proc body once. The Python
-       app, the REST endpoint, and any MCP tool call stay identical.
+       The proc below uses the DiskANN index when it's there and falls back
+       to exact kNN when it isn't. The Python app doesn't know or care which
+       path ran. It just sees a search_path column.
 
      MODEL ABSTRACTION
        The embedding model name ('ollama' here) is inside the proc. Swap the
@@ -166,8 +236,22 @@ GO
    -----------------------------------------------------------------------------
    Called by the Python app with the user's natural-language question.
    SQL Server embeds the prompt via AI_GENERATE_EMBEDDINGS (calling Ollama),
-   runs VECTOR_DISTANCE against all stored embeddings, and returns the top-K
-   most semantically similar questions with their chunk text for RAG context.
+   then walks the DiskANN graph with VECTOR_SEARCH.
+
+   Here's the catch on SQL Server 2025: VECTOR_SEARCH with no vector index
+   fails with Msg 42227. During the drop-insert-rebuild cycle (Section 4a)
+   there's no index. So the proc checks sys.vector_indexes and falls back to
+   exact kNN with VECTOR_DISTANCE.
+
+   One more gotcha: CREATE PROCEDURE itself fails with Msg 42227 if the
+   index doesn't exist when you create it. Once it's created, dropping the
+   index is fine and the IF branch handles it. Run this while vec_idx exists.
+
+   And a security gotcha: catalog views only show metadata the CALLER can
+   see. Ownership chaining covers the table, not sys.vector_indexes. Run as
+   rag_app, the IF EXISTS check sees nothing and the proc silently takes
+   the slow kNN path. Section 3 grants VIEW DEFINITION on the one table to
+   fix that. It shows metadata only, not data.
 ----------------------------------------------------------------------------- */
 
 CREATE OR ALTER PROCEDURE dbo.find_similar_questions
@@ -178,26 +262,53 @@ BEGIN
     SET NOCOUNT ON;
 
     -- SQL Server handles the embedding call — the app sends plain text.
-    -- Swapping the model here is the only change needed to change models.
     DECLARE @query_vector VECTOR(768) =
         AI_GENERATE_EMBEDDINGS(@prompt USE MODEL ollama);
 
-    -- Return the top-@top most similar questions.
-    -- chunk is the RAG context — the text the vector represents.
-    -- No VECTOR column in the result set: the app gets text and numbers.
-    SELECT TOP (@top)
-        p.Id                                                        AS post_id,
-        p.Title                                                     AS title,
-        qe.chunk                                                    AS context_chunk,
-        REPLACE(REPLACE(REPLACE(
-            ISNULL(p.Tags, N''), '><', ', '), '<', ''), '>', '')    AS tags,
-        p.Score                                                     AS community_score,
-        p.ViewCount                                                 AS view_count,
-        p.AnswerCount                                               AS answer_count,
-        VECTOR_DISTANCE('cosine', @query_vector, qe.embeddings)     AS distance
-    FROM dbo.QuestionEmbeddings qe
-    JOIN dbo.Posts              p  ON p.Id = qe.PostId
-    ORDER BY distance;
+    IF EXISTS (SELECT 1 FROM sys.vector_indexes
+               WHERE object_id = OBJECT_ID('dbo.QuestionEmbeddings'))
+        SELECT
+            p.Id                                                        AS post_id,
+            p.Title                                                     AS title,
+            qe.chunk                                                    AS context_chunk,
+            REPLACE(REPLACE(REPLACE(
+                ISNULL(p.Tags, N''), '><', ', '), '<', ''), '>', '')    AS tags,
+            p.Score                                                     AS community_score,
+            p.ViewCount                                                 AS view_count,
+            p.AnswerCount                                               AS answer_count,
+            s.distance                                                  AS distance,
+            'ANN'                                                       AS search_path
+        FROM VECTOR_SEARCH(
+            TABLE      = dbo.QuestionEmbeddings AS qe,
+            COLUMN     = [embeddings],
+            SIMILAR_TO = @query_vector,
+            METRIC     = 'cosine',
+            TOP_N      = @top
+        ) AS s
+        JOIN dbo.Posts p ON p.Id = qe.PostId
+        ORDER BY s.distance;
+    ELSE
+        SELECT
+            p.Id                                                        AS post_id,
+            p.Title                                                     AS title,
+            n.chunk                                                     AS context_chunk,
+            REPLACE(REPLACE(REPLACE(
+                ISNULL(p.Tags, N''), '><', ', '), '<', ''), '>', '')    AS tags,
+            p.Score                                                     AS community_score,
+            p.ViewCount                                                 AS view_count,
+            p.AnswerCount                                               AS answer_count,
+            n.distance                                                  AS distance,
+            'kNN'                                                       AS search_path
+        FROM (
+            SELECT TOP (@top)
+                qe.PostId,
+                qe.chunk,
+                VECTOR_DISTANCE('cosine', @query_vector, qe.embeddings) AS distance
+            FROM dbo.QuestionEmbeddings qe
+            ORDER BY distance
+        ) AS n
+        JOIN dbo.Posts p ON p.Id = n.PostId
+        ORDER BY n.distance;
 END;
 GO
 
@@ -248,31 +359,16 @@ BEGIN
 END;
 GO
 
--- Test: find a question, then get its top answer:
-DECLARE @q_id INT;
-/* NOTE: In T-SQL you cannot call EXEC inside a SELECT subquery.
-   The Python app calls find_similar_questions, then loops over results
-   calling get_top_answer for each. Demonstrate the proc independently below.
-
-   The following block is intentionally commented out — OPENROWSET(TSQLV4)
-   was a placeholder that would fail if executed:
-
-   SELECT TOP (1) @q_id = post_id
-   FROM (
-       SELECT TOP (1) post_id
-       FROM OPENROWSET(TSQLV4, N'', N'')
-   ) x;
-*/
-
--- Find the highest-scored question we have embedded, then get its answer:
-SELECT TOP (1) p.Id, p.Title, p.Score
-FROM dbo.Posts p
-JOIN dbo.QuestionEmbeddings qe ON qe.PostId = p.Id
-ORDER BY p.Score DESC;
-GO
-
--- Paste the Id from above into @question_post_id:
-EXEC dbo.get_top_answer @question_post_id = 927358;   
+-- Test: get the accepted (or best) answer for our highest-scored embedded question.
+-- The Python app does the same thing in a loop over find_similar_questions results.
+DECLARE @q_id INT = (
+    SELECT TOP (1) p.Id
+    FROM dbo.Posts p
+    JOIN dbo.QuestionEmbeddings qe ON qe.PostId = p.Id
+    ORDER BY p.Score DESC
+);
+SELECT Id, Title, Score FROM dbo.Posts WHERE Id = @q_id;
+EXEC dbo.get_top_answer @question_post_id = @q_id;
 GO
 
 
@@ -291,6 +387,8 @@ GO
      - EXECUTE dbo.find_similar_questions    (semantic search)
      - EXECUTE dbo.get_top_answer            (answer retrieval)
      - EXECUTE EXTERNAL MODEL::ollama        (needed for AI_GENERATE_EMBEDDINGS)
+     - VIEW DEFINITION on QuestionEmbeddings (so the proc can see the vector
+                                              index in sys.vector_indexes)
 
    What rag_app CANNOT do:
      - Read the VECTOR(768) column directly
@@ -304,10 +402,12 @@ GO
 USE [master];
 GO
 
--- Create the application login (idempotent):
+-- Create the application login (idempotent).
+-- CHECK_POLICY OFF and a password in a script are demo shortcuts. In production
+-- use Microsoft Entra ID or a policy-checked password kept in a secret store.
 IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'rag_app')
     CREATE LOGIN rag_app
-    WITH PASSWORD        = 'RagP@ss2025!',   -- demo only — change before production
+    WITH PASSWORD        = 'RagP@ss2025!',
          CHECK_EXPIRATION = OFF,
          CHECK_POLICY     = OFF;
 GO
@@ -323,7 +423,8 @@ GO
 -- Grant exactly what the app needs — nothing more:
 GRANT EXECUTE ON dbo.find_similar_questions TO rag_app;
 GRANT EXECUTE ON dbo.get_top_answer         TO rag_app;
-GRANT EXECUTE ON EXTERNAL MODEL::ollama     TO rag_app;  -- proc calls AI_GENERATE_EMBEDDINGS
+GRANT EXECUTE ON EXTERNAL MODEL::ollama     TO rag_app;  -- docs: required to use the model
+GRANT VIEW DEFINITION ON dbo.QuestionEmbeddings TO rag_app;  -- metadata only; without it the proc can't see vec_idx
 GO
 
 -- Verify: see the complete permission set for rag_app:
@@ -358,31 +459,49 @@ GO
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
-   4a. Incremental embedding: embed only what hasn't been embedded yet
+   4a. The maintenance cycle: drop, embed, rebuild (SQL Server 2025)
    -----------------------------------------------------------------------------
-   The NOT EXISTS pattern makes the embedding pipeline:
+   On SQL Server 2025 a table with a vector index is read-only. INSERT,
+   UPDATE, DELETE, and MERGE fail with Msg 42231, and TRUNCATE TABLE fails
+   with Msg 42232. ALLOW_STALE_VECTOR_INDEX doesn't help here: the docs say
+   it isn't available in SQL Server 2025 (it's Azure SQL Database and Fabric).
 
-     RESUMABLE   — safe to kill and restart mid-run
-     EFFICIENT   — only the delta (new rows) on each invocation
-     IDEMPOTENT  — running twice produces the same result
+   So new content goes in through a cycle:
 
-   In production, schedule this as a SQL Agent job or run it from the
-   application deployment pipeline after new content is loaded.
+     1. DROP the vector index    → table becomes writable
+     2. INSERT new embeddings    → only the rows that aren't embedded yet
+     3. CREATE the vector index  → rebuild the graph over every row
 
-   IMPORTANT: on SQL Server 2025, you must either:
-     (a) Drop the vector index before running the INSERT, or
-     (b) Set ALLOW_STALE_VECTOR_INDEX = ON to allow inserts without rebuild
-   See Section 4b for the recommended drop-insert-rebuild cycle.
+   Let's watch the app's proc switch paths while it happens. It answers from
+   the index before step 1, from exact kNN during the window, and from the
+   index again after step 3. No error, no app change.
+
+   The NOT EXISTS guard in step 2 makes the load resumable and idempotent:
+   kill it, rerun it, and it picks up where it left off.
+
+   Schedule this in a low-traffic window. Azure SQL Database, Fabric, and
+   Managed Instance (Always-up-to-date) don't need it: their latest-version
+   index supports DML and maintains itself in the background.
 ----------------------------------------------------------------------------- */
 
 USE [StackOverflow];
 GO
 
--- Embed the next batch of unembedded questions:
-DECLARE @batch_size INT = 100;
+PRINT 'Before: the proc uses the index.';
+EXEC dbo.find_similar_questions @prompt = N'how do I undo my last git commit?', @top = 3;
+GO
 
+PRINT 'Step 1: drop the vector index. The table is now writable.';
+DROP INDEX IF EXISTS vec_idx ON dbo.QuestionEmbeddings;
+GO
+
+PRINT 'During the window: same proc, exact kNN path.';
+EXEC dbo.find_similar_questions @prompt = N'how do I undo my last git commit?', @top = 3;
+GO
+
+PRINT 'Step 2: embed the next 100 questions that aren''t embedded yet.';
 ;WITH new_questions AS (
-    SELECT TOP (@batch_size)
+    SELECT TOP (100)
         p.Id,
         p.Title + N' ' +
             REPLACE(REPLACE(REPLACE(ISNULL(p.Tags, N''), N'><', N' '), N'<', N''), N'>', N'')
@@ -390,7 +509,6 @@ DECLARE @batch_size INT = 100;
     FROM dbo.Posts p
     WHERE p.PostTypeId = 1
       AND p.Title IS NOT NULL
-      -- Skip rows already in the embeddings table (incremental / resumable):
       AND NOT EXISTS (
           SELECT 1 FROM dbo.QuestionEmbeddings qe WHERE qe.PostId = p.Id
       )
@@ -404,107 +522,128 @@ SELECT
 FROM new_questions q;
 GO
 
--- After the batch, check coverage:
-SELECT
-    COUNT(*) AS embedded_count,
-    (SELECT COUNT(*) FROM dbo.Posts WHERE PostTypeId = 1) AS total_questions
-FROM dbo.QuestionEmbeddings;
-GO
-
-
-/* -----------------------------------------------------------------------------
-   4b. The drop-rebuild cycle for index maintenance (SQL Server 2025)
-   -----------------------------------------------------------------------------
-   The recommended production pattern for workloads that periodically load
-   new content into an already-indexed table:
-
-     1. DROP the vector index    → table becomes writable
-     2. INSERT new embeddings    → run the incremental batch from 4a
-     3. CREATE the vector index  → rebuild the graph from all current rows
-
-   Schedule this during a low-traffic maintenance window.
-   The build in step 3 is offline — queries that arrive during the build fall
-   back to exact kNN (full scan) because no vector index is present.
-
-   Azure SQL Database / Fabric (latest-version DiskANN) don't require this
-   cycle — the index supports live DML with automatic background maintenance.
------------------------------------------------------------------------------ */
-
-PRINT 'Step 1: Dropping vector index — table is now writable.';
-IF EXISTS (
-    SELECT 1 FROM sys.indexes
-    WHERE  name      = 'vec_idx'
-      AND  object_id = OBJECT_ID('dbo.QuestionEmbeddings')
-)
-    DROP INDEX vec_idx ON dbo.QuestionEmbeddings;
-GO
-
-PRINT 'Step 2: Incremental embedding batch (runs the NOT EXISTS INSERT from 4a).';
--- (re-run Section 4a INSERT here)
-PRINT '...embedding batch complete.';
-GO
-
-PRINT 'Step 3: Rebuilding the DiskANN index.';
+PRINT 'Step 3: rebuild the DiskANN index.';
 DECLARE @rebuild_start DATETIME2 = SYSDATETIME();
 
 CREATE VECTOR INDEX vec_idx ON dbo.QuestionEmbeddings([embeddings])
-WITH (metric = 'cosine', type = 'diskann', maxdop = 8);
+WITH (metric = 'cosine', type = 'diskann');
 
 SELECT
-    'Index rebuild complete' AS status,
     DATEDIFF(MILLISECOND, @rebuild_start, SYSDATETIME()) AS build_time_ms,
     (SELECT COUNT(*) FROM dbo.QuestionEmbeddings)        AS rows_in_index;
 GO
 
+PRINT 'After: back on the index.';
+EXEC dbo.find_similar_questions @prompt = N'how do I undo my last git commit?', @top = 3;
+GO
+
 
 /* -----------------------------------------------------------------------------
-   4c. Model swap pattern: change the embedding model in one place
+   4b. [OPTIONAL] Model swap: a new embedding model, side by side
    -----------------------------------------------------------------------------
-   The EXTERNAL MODEL is the only place the model endpoint is named.
-   All queries, procs, and application code reference the model by name only.
+   The EXTERNAL MODEL is the only place the model endpoint is named. Every
+   query refers to the model by name.
 
-   To upgrade the model (e.g., 768-dim nomic → 1024-dim mxbai-embed-large):
+   Changing models is bigger than changing a name, though. Vectors from two
+   models live in different coordinate spaces, so you can't compare them.
+   And a new model usually has a new dimension count. mxbai-embed-large
+   produces 1,024 dimensions, and our column is VECTOR(768).
 
-     1. Verify new model's dimensions
-     2. Drop the vector index (table writable)
-     3. Truncate QuestionEmbeddings (old vectors are incompatible with new model)
-     4. Drop and recreate the EXTERNAL MODEL at the same name
-     5. Re-run the embedding pipeline (all rows get new vectors)
-     6. Update the VECTOR(768) column definition to VECTOR(1024)
-        (requires table recreation or schema change — plan accordingly)
-     7. Rebuild the vector index
+   Here's the pattern that keeps the app online:
 
-   Steps 4–7 are the ONLY changes. The Python app sends the same SQL call.
-   The two stored procs are UNCHANGED. The model is an implementation detail.
+     1. Register the new model next to the old one
+     2. Build a second satellite table with the new VECTOR(n)
+     3. Backfill it and build its vector index
+     4. CREATE OR ALTER the proc to point at the new table and model
+     5. Drop the old table and model
+
+   The app never changes. Step 4 is the cutover, and it's one statement.
+
+   Prerequisite (run on the host, ~670 MB):
+       ollama pull mxbai-embed-large
+
+   Warm it up before the demo. The first call to a cold Ollama model can take
+   longer than SQL Server's REST timeout and fail with Msg 31629:
+       curl -s http://localhost:11434/api/embed \
+            -d '{"model":"mxbai-embed-large","input":"warm up"}' > /dev/null
+
+   The 1,000-row backfill below takes about two minutes on an M2.
 ----------------------------------------------------------------------------- */
 
 -- Current model registration:
 SELECT
     name,
     location,
-    model_type_desc,  -- 'EMBEDDINGS'
+    model,
+    model_type_desc,
     api_format
 FROM sys.external_models;
 GO
 
--- Hypothetical swap to Azure OpenAI (do not run — illustrative):
 /*
--- Drop the current model:
-DROP EXTERNAL MODEL ollama;
-GO
-
--- Register Azure OpenAI at the same name:
-CREATE EXTERNAL MODEL ollama
+-- Step 1: register the second model on the same Ollama endpoint.
+CREATE EXTERNAL MODEL ollama_mxbai
 WITH (
-    LOCATION   = 'https://<your-resource>.openai.azure.com/openai/deployments/text-embedding-3-small',
-    API_FORMAT = 'AzureOpenAI',
+    LOCATION   = 'https://model-web:443/api/embed',
+    API_FORMAT = 'Ollama',
     MODEL_TYPE = EMBEDDINGS,
-    MODEL      = 'text-embedding-3-small',    -- 1536 dimensions
-    CREDENTIAL = [https://<your-resource>.openai.azure.com]
+    MODEL      = 'mxbai-embed-large'
 );
 GO
--- Every query that calls AI_GENERATE_EMBEDDINGS(...USE MODEL ollama) now
--- routes to Azure OpenAI. The application and stored proc code is unchanged.
+
+-- The dimension count is a property of the model. Check it before you
+-- design the column:
+DECLARE @v NVARCHAR(MAX) =
+    CAST(AI_GENERATE_EMBEDDINGS(N'dimension check' USE MODEL ollama_mxbai) AS NVARCHAR(MAX));
+SELECT COUNT(*) AS dimensions FROM OPENJSON(@v);   -- 1024
+GO
+
+-- Steps 2-3: second satellite table, backfill, index.
+CREATE TABLE dbo.QuestionEmbeddings_mxbai
+(
+    PostId     INT            NOT NULL,
+    embeddings VECTOR(1024)   NOT NULL,
+    chunk      NVARCHAR(4000) NOT NULL,
+    CONSTRAINT PK_QuestionEmbeddings_mxbai PRIMARY KEY CLUSTERED (PostId)
+) ON [EMBEDDINGS];
+GO
+
+INSERT INTO dbo.QuestionEmbeddings_mxbai (PostId, chunk, embeddings)
+SELECT TOP (1000) qe.PostId, qe.chunk, AI_GENERATE_EMBEDDINGS(qe.chunk USE MODEL ollama_mxbai)
+FROM dbo.QuestionEmbeddings qe
+JOIN dbo.Posts p ON p.Id = qe.PostId
+ORDER BY p.Score DESC;   -- the same top questions the 768-dim table started with
+GO
+
+CREATE VECTOR INDEX vec_idx_mxbai ON dbo.QuestionEmbeddings_mxbai([embeddings])
+WITH (metric = 'cosine', type = 'diskann');
+GO
+
+-- Same question, both models. Distances aren't comparable across models;
+-- compare which questions come back.
+DECLARE @q768  VECTOR(768)  = AI_GENERATE_EMBEDDINGS(N'how do I undo my last git commit?' USE MODEL ollama);
+DECLARE @q1024 VECTOR(1024) = AI_GENERATE_EMBEDDINGS(N'how do I undo my last git commit?' USE MODEL ollama_mxbai);
+
+SELECT 'nomic 768' AS model, p.Title, s.distance
+FROM VECTOR_SEARCH(TABLE = dbo.QuestionEmbeddings AS t, COLUMN = [embeddings],
+                   SIMILAR_TO = @q768, METRIC = 'cosine', TOP_N = 3) AS s
+JOIN dbo.Posts p ON p.Id = t.PostId
+UNION ALL
+SELECT 'mxbai 1024', p.Title, s.distance
+FROM VECTOR_SEARCH(TABLE = dbo.QuestionEmbeddings_mxbai AS t, COLUMN = [embeddings],
+                   SIMILAR_TO = @q1024, METRIC = 'cosine', TOP_N = 3) AS s
+JOIN dbo.Posts p ON p.Id = t.PostId;
+GO
+
+-- Step 4: CREATE OR ALTER dbo.find_similar_questions with VECTOR(1024),
+-- USE MODEL ollama_mxbai, and TABLE = dbo.QuestionEmbeddings_mxbai.
+-- GRANT EXECUTE ON EXTERNAL MODEL::ollama_mxbai TO rag_app; first, and
+-- GRANT VIEW DEFINITION on the new table (see Section 2a).
+
+-- Cleanup, so the demo can be re-run:
+DROP TABLE IF EXISTS dbo.QuestionEmbeddings_mxbai;
+DROP EXTERNAL MODEL ollama_mxbai;
+GO
 */
 
 
@@ -525,8 +664,8 @@ GO
       │                           │ ────────────────────────────► │
       │                           │ ◄──────── VECTOR(768) ─────── │
       │                           │                               │
-      │                           │  VECTOR_DISTANCE (kNN scan)   │
-      │                           │  ORDER BY distance            │
+      │                           │  VECTOR_SEARCH (DiskANN walk) │
+      │                           │  or VECTOR_DISTANCE (kNN)     │
       │                           │  → top-K rows                 │
       │ ◄────── result set ────── │                               │
       │                           │                               │
@@ -564,3 +703,8 @@ EXEC dbo.find_similar_questions
     @prompt = N'SQL query is running slow — how do I find out why?',
     @top    = 3;
 GO
+
+-- Now run the app from a terminal. It logs in as rag_app and prints which
+-- search path (ANN or kNN) served each question:
+--     docker compose run --rm rag-app python demos/rag-app.py "how do I undo my last git commit?"
+--     docker compose --profile app up rag-app-ui      (http://localhost:8501)

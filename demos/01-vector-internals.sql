@@ -15,8 +15,9 @@ GO
 
   Prerequisites:
     Stack is up (./start.sh), StackOverflow is restored and embedded.
-    The sql-init container ran demos/vector-demos.sql at startup —
-    QuestionEmbeddings is populated with ~10,000 rows.
+    The sql-init container ran setup/init.sql at startup, which embeds
+    1,000 rows. Run setup/expand-embeddings.sh to grow to 10,000 rows
+    (recommended; Demo 02's scale numbers assume 10,000).
 
   Connect:
     Server:   localhost,1435
@@ -25,9 +26,13 @@ GO
 
   Run sections top-to-bottom. Every section is idempotent.
 
-  LIVE-DEMO TIP: Sections 1-3 are "look, don't touch" catalog queries.
-    Sections 4-5 are the ones your audience will want to see run live.
-    Budget roughly 15 min on internals (1-3) and 15 min on execution (4-5).
+  TIME BUDGET: 15 minutes of a 60-minute session.
+    1a-1c  storage and catalog       5 min
+    1e     float16 (first two queries) 2 min
+    3      AI_GENERATE_EMBEDDINGS    3 min
+    4-5    distance and kNN plan     5 min
+    [OPTIONAL] sections are deep dives for Q&A or a longer slot: 1d, 1e-3
+    onward, and 2.
 =============================================================================
 */
 
@@ -66,6 +71,12 @@ GO
    The 8-byte prefix is a binary metadata header SQL Server prepends to every
    stored VECTOR value. DATALENGTH() and sys.columns.max_length both include it.
    Use sys.columns.vector_dimensions for the authoritative dimension count.
+
+   What's documented and what's observed: the docs say each element is a
+   4-byte float and give the 1,998 / 3,996 limits. The 8-byte header isn't
+   documented. You see it here with DATALENGTH and sys.columns, so treat it
+   as an implementation detail that could change.
+     https://learn.microsoft.com/en-us/sql/t-sql/data-types/vector-data-type
 
    This is the foundation of everything that follows: the type is not text,
    not JSON, not a blob you manage yourself. It's a native numeric array with
@@ -109,9 +120,10 @@ GO
        (DATALENGTH(col) - 8) / 4  → 768
 
    Compare that to the JSON text representation (what you see when you SELECT
-   the column). Storing 768 floats as a JSON array like [0.123456, -0.987654, ...]
-   takes roughly 10–12 characters per float × 768 = ~8,000–9,000 bytes —
-   roughly 3× more space and no type enforcement.
+   the column). SQL Server writes each float in scientific notation, like
+   4.3272693e-002, so 768 of them come to about 12,000 characters. As
+   NVARCHAR that's ~24,000 bytes, nearly 8× the binary size, with no type
+   enforcement.
 
    Prefer sys.columns.vector_dimensions (see §1a) over the DATALENGTH arithmetic
    — it's cleaner and correct for both float32 and float16 columns.
@@ -171,63 +183,63 @@ GO
 
 
 /* -----------------------------------------------------------------------------
-   1d. Page-level storage — looking at the raw data page  [deep dive / optional]
+   1d. [OPTIONAL] Page-level storage: where does the vector actually live?
    -----------------------------------------------------------------------------
-   DBCC PAGE reveals the actual on-disk layout of an 8KB data page. For a
-   VECTOR(768) row (3,072 bytes) SQL Server stores the row across pages using
-   the normal row-overflow / LOB storage mechanism — large rows spill to LOB
-   pages when the inline record exceeds the 8060-byte row limit.
+   A VECTOR(768) is 3,080 bytes. A data page holds about 8,060 bytes of row
+   data. So the question is: does the vector stay in the row, or does it get
+   pushed off to another page?
 
-   Step 1: find the physical location (file : page : slot) of a row.
-   Step 2: use DBCC PAGE to dump the page and inspect the binary content.
-
-   DBCC TRACEON(3604) redirects DBCC output to the client (SSMS Messages tab)
-   instead of the SQL Server error log.
-
-   WHERE IS THIS DOCUMENTED?
-   ─────────────────────────
-   The VECTOR docs state vectors are "stored in an optimized binary format"
-   but say nothing about row-overflow:
-     https://learn.microsoft.com/en-us/sql/relational-databases/vectors/vectors-sql-server
-
-   The row-overflow mechanism itself is documented in the Pages and Extents
-   Architecture Guide — specifically the "Large row support" section:
+   Here's the documented rule from the Pages and Extents Architecture Guide:
+   "When the total row size exceeds the 8,060-byte limitation, the Database
+   Engine dynamically moves one or more variable length columns to pages in a
+   ROW_OVERFLOW_DATA allocation unit, starting with the widest column."
      https://learn.microsoft.com/en-us/sql/relational-databases/pages-and-extents-architecture-guide
 
-   Key quote: "When the total row size exceeds the 8,060-byte limitation, the
-   Database Engine dynamically moves one or more variable length columns to
-   pages in a ROW_OVERFLOW_DATA allocation unit, starting with the widest column."
+   The VECTOR docs don't say anything about row-overflow, so let's measure it.
+   Our rows are PostId (4) + vector (3,080) + chunk (a title and tags, a few
+   hundred bytes at most). That's well under 8,060, so the vector stays
+   IN_ROW. Two rows fit on a page. You'll see closer to 1.5 rows per page,
+   though: we inserted in Score order, not PostId order, so page splits left
+   pages partly empty. A vector would only overflow if chunk grew past
+   roughly 4,900 bytes.
 
-   Here's the connection you have to make yourself: VECTOR shares system_type_id = 165
-   with varbinary (see §1a), so it follows the same overflow rules as any other
-   large variable-length column. A VECTOR(768) is 3,080 bytes; combined with
-   PostId (4) + chunk (up to ~8,000) the row exceeds 8,060 bytes, so the
-   embeddings column spills to a ROW_OVERFLOW_DATA allocation unit.
-
-   The DBCC PAGE output is the empirical confirmation — this specific behavior
-   for VECTOR columns is not yet explicitly called out in the official docs.
-
-   NOTE: This uses undocumented internals. Use for education only.
+   Why you care: every kNN scan reads every page. At ~1.5 rows per page a
+   full scan of 10,000 rows reads ~6,700 pages. That's the number you'll see
+   in STATISTICS IO in Section 5 and in Demo 02.
 ----------------------------------------------------------------------------- */
 
--- Step 1: physical location of one row (fn_PhysLocFormatter is the readable form):
-SELECT TOP (1)
-    qe.PostId,
-    sys.fn_PhysLocFormatter(%%physloc%%) AS physical_location   -- (file:page:slot)
-FROM dbo.QuestionEmbeddings qe;
+-- Which allocation units hold the table's data? ROW_OVERFLOW_DATA stays at 0.
+SELECT
+    au.type_desc            AS allocation_unit,
+    au.total_pages,
+    au.data_pages,
+    p.rows,
+    CAST(p.rows * 1.0 / NULLIF(au.data_pages, 0) AS DECIMAL(5,2)) AS rows_per_page
+FROM sys.partitions       p
+JOIN sys.allocation_units au ON au.container_id = p.hobt_id
+WHERE p.object_id = OBJECT_ID('dbo.QuestionEmbeddings')
+  AND p.index_id  = 1;
 GO
 
--- Step 2: dump the page.
--- Replace the page number with the value returned above.
--- Output in the Messages tab shows slot data including the raw VECTOR bytes.
-/*
-DBCC TRACEON(3604);                        -- redirect output to client
+-- The largest row we store, in bytes:
+SELECT MAX(4 + DATALENGTH(embeddings) + DATALENGTH(chunk)) AS max_row_payload_bytes
+FROM dbo.QuestionEmbeddings;
 GO
-DBCC PAGE('StackOverflow', 1, 8096, 3);   -- mode 3 = full row data
-GO
+
+-- DBCC PAGE is undocumented. Use it to look, never in production code.
+-- fn_PhysLocCracker gives the file, page, and slot for a row.
+DECLARE @file INT, @page INT, @sql NVARCHAR(200);
+SELECT TOP (1) @file = plc.file_id, @page = plc.page_id
+FROM dbo.QuestionEmbeddings qe
+CROSS APPLY sys.fn_PhysLocCracker(%%physloc%%) AS plc;
+
+SET @sql = CONCAT(N'DBCC PAGE(''StackOverflow'', ', @file, N', ', @page, N', 3);');
+DBCC TRACEON(3604);   -- send DBCC output to the Messages tab
+EXEC (@sql);
 DBCC TRACEOFF(3604);
 GO
-*/
+-- In the Messages tab, look for m_slotCnt = 2 in the page header and two
+-- slots, each carrying a ~3 KB vector inline.
 
 
 /* =============================================================================
@@ -255,7 +267,7 @@ GO
    float16 also DOUBLES the dimension ceiling:
      float32  max 1,998 dimensions
      float16  max 3,996 dimensions
-   This unlocks larger models like text-embedding-large (3,072 dims).
+   This unlocks larger models like text-embedding-3-large (3,072 dims).
 
    The trade-off: float16 has reduced numerical precision. The representable
    range is ±65,504 (vs. ±3.4×10³⁸ for float32). For semantic similarity
@@ -292,7 +304,7 @@ GO
 -- float32: 3,080 bytes (8 header + 3,072 payload)   float16: 1,544 bytes (8 header + 1,536 payload)
 -- Payload is exactly half; the 8-byte header is the same for both types.
 
--- 1e-3. The new sys.columns metadata columns for float16:
+-- 1e-3. [OPTIONAL] The new sys.columns metadata columns for float16:
 --   vector_dimensions     — dimension count (same as max_length / element_size)
 --   vector_base_type      — 0 = float32, 1 = float16
 --   vector_base_type_desc — 'float32' or 'float16'
@@ -313,11 +325,11 @@ GO
 
 SELECT
     c.name                  AS column_name,
-    c.max_length            AS raw_max_length,    -- 3072 for float32, 1536 for float16
+    c.max_length            AS raw_max_length,    -- 3080 for float32, 1544 for float16 (includes the 8-byte header)
     c.vector_dimensions     AS dimensions,         -- new column: always 768
     c.vector_base_type      AS base_type_code,     -- 0 = float32, 1 = float16
     c.vector_base_type_desc AS base_type_name      -- 'float32' | 'float16'
-FROM sys.columns c
+FROM tempdb.sys.columns c
 WHERE c.object_id = OBJECT_ID('tempdb..#vec_type_demo')
 ORDER BY c.column_id;
 GO
@@ -361,9 +373,10 @@ GO
 --     Values outside this range (e.g., 70000.0) raise Msg 42241 at insert time.
 --     Unit-normalized embeddings (all values in [−1, +1]) are always safe.
 --
---   TDS transport: float16 vectors are currently sent as varchar(max) JSON
---     over the wire to client drivers (ODBC, JDBC, .NET). No binary TDS
---     transport yet — slightly more network overhead than float32.
+--   TDS transport: ODBC 18.7.1+ and JDBC 13.4+ send float16 in binary.
+--     Older drivers get varchar(max) JSON, which costs more on the wire.
+--
+--   ARM64: the docs say Arm64 architectures don't support float16.
 --
 
 -- Demonstrate the cross-type error (catches the error, prints the message):
@@ -394,13 +407,14 @@ GO
 --   USE float16 WHEN:
 --     - You need to store millions of embeddings and storage cost matters
 --     - Your embedding model produces unit-normalized values (all values ≤ 1)
---     - You need dimensions > 1,998 (e.g., text-embedding-large at 3,072 dims)
+--     - You need dimensions > 1,998 (e.g., text-embedding-3-large at 3,072 dims)
 --     - Approximate similarity search (RAG retrieval) is the workload
 --
 --   STAY WITH float32 WHEN:
 --     - You need exact numerical fidelity (scientific / financial workloads)
 --     - You mix embedding and non-embedding vector workloads on the same column
---     - Your client drivers need binary TDS transport for performance
+--     - Your client drivers are older than ODBC 18.7.1 / JDBC 13.4 (no binary float16)
+--     - You run on Arm64
 
 -- Summary comparison:
 SELECT col, float32_value, float16_value
@@ -411,7 +425,7 @@ FROM (VALUES
     ('Value range',             '±3.4×10³⁸',   '±65,504'),
     ('Unit-norm safe?',         'Yes',          'Yes'),
     ('Cross-type VECTOR_DISTANCE','Supported', 'Not supported (same type required)'),
-    ('Binary TDS transport',    'Yes',          'Not yet (JSON array over wire)'),
+    ('Binary TDS transport',    'Yes',          'ODBC 18.7.1+ / JDBC 13.4+'),
     ('ARM64 support',           'Yes',          'No'),
     ('Preview feature required','No',           'Yes')
 ) AS t(col, float32_value, float16_value);
@@ -419,7 +433,7 @@ GO
 
 
 /* =============================================================================
-   SECTION 2 — PHYSICAL STORAGE: FILEGROUPS AND DATA FILES
+   SECTION 2 — [OPTIONAL] PHYSICAL STORAGE: FILEGROUPS AND DATA FILES
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
@@ -614,11 +628,16 @@ GO
      1. Embed the query text                     (one HTTP call to Ollama)
      2. Scan EVERY row in QuestionEmbeddings     (O(n) reads)
      3. Compute VECTOR_DISTANCE for every row    (O(n) float arithmetic)
-     4. Sort all n distances and take the top K  (O(n log n))
+     4. Keep the K smallest distances            (Top N Sort, O(n log K))
 
    This is called an exhaustive or brute-force kNN search. It guarantees
    exact (perfect-recall) results. It's fine for tens of thousands of rows.
    It doesn't scale to millions.
+
+   One query-shape tip: rank inside the satellite table first, then join to
+   Posts for the 10 winners. If you join first, the optimizer can join every
+   row to Posts before the sort. On 3,600 rows that cost 15,506 extra reads
+   on Posts. The CTE below keeps the join to 10 rows.
 
    SET STATISTICS IO and TIME show exactly what it cost.
    After running this, look at the logical reads in the Messages tab —
@@ -631,22 +650,26 @@ GO
 DECLARE @query_text   NVARCHAR(MAX) = N'how do I undo my last git commit?';
 DECLARE @query_vector VECTOR(768)   = AI_GENERATE_EMBEDDINGS(@query_text USE MODEL ollama);
 
-SELECT TOP (10)
-    p.Id,
-    p.Title,
-    p.Score,
-    VECTOR_DISTANCE('cosine', @query_vector, qe.embeddings) AS distance
-FROM dbo.QuestionEmbeddings qe
-JOIN dbo.Posts p ON qe.PostId = p.Id
-ORDER BY distance;    -- ORDER BY distance = full-sort of all n computed values
+WITH nearest AS (
+    SELECT TOP (10)
+        qe.PostId,
+        VECTOR_DISTANCE('cosine', @query_vector, qe.embeddings) AS distance
+    FROM dbo.QuestionEmbeddings qe
+    ORDER BY distance
+)
+SELECT p.Id, p.Title, p.Score, n.distance
+FROM nearest n
+JOIN dbo.Posts p ON p.Id = n.PostId
+ORDER BY n.distance;
 GO
 SET STATISTICS IO OFF;
 SET STATISTICS TIME OFF;
 GO
 
 -- The key numbers:
---   "logical reads" on QuestionEmbeddings = every data page in the EMBEDDINGS file.
---   "elapsed time" grows linearly with row count — double the rows, double the time.
+--   "logical reads" on QuestionEmbeddings = every data page of the table.
+--   Posts reads stay tiny: 10 key lookups.
+--   "elapsed time" grows linearly with row count. Demo 02 Section 2b measures it.
 
 
 /* -----------------------------------------------------------------------------
@@ -655,7 +678,11 @@ GO
    Enable INCLUDE ACTUAL EXECUTION PLAN in SSMS (Ctrl+M), then re-run the
    query above. You'll see this operator chain:
 
-     [Clustered Index Scan]  →  [Compute Scalar]  →  [Top Sort]  →  [SELECT]
+     [Clustered Index Scan]  →  [Compute Scalar]  →  [Top N Sort]
+        →  [Nested Loops to Posts, 10 rows]  →  [SELECT]
+
+   On a multi-core box you may also see Parallelism operators around the
+   scan.
 
    Operator by operator:
 
@@ -668,16 +695,16 @@ GO
        Calls VECTOR_DISTANCE(cosine, @query_vector, qe.embeddings) for each row.
        This is float arithmetic over 768 values per row.
 
-     Top Sort
-       Maintains a min-heap of the K closest candidates seen so far. It only
-       retains K rows in memory at a time, but it must read ALL n rows before
-       it can be certain the heap is correct.
+     Top N Sort
+       Keeps only the K closest candidates seen so far. It holds K rows in
+       memory, but it must read ALL n rows before it can be certain it has
+       the right K.
 
-     SELECT
-       Returns the K rows.
+     Nested Loops + Clustered Index Seek on Posts
+       Fetches titles for the 10 winners.
 
    The DiskANN index (Demo 2) replaces the Scan + Compute Scalar with a
-   dedicated graph-walk operator that reads far fewer rows.
+   graph walk. Demo 2 measures when that pays off and when it doesn't.
 ----------------------------------------------------------------------------- */
 
 -- Capture plan as XML for offline analysis:
@@ -686,20 +713,24 @@ GO
 DECLARE @query_text   NVARCHAR(MAX) = N'how do I undo my last git commit?';
 DECLARE @query_vector VECTOR(768)   = AI_GENERATE_EMBEDDINGS(@query_text USE MODEL ollama);
 
-SELECT TOP (10)
-    p.Id,
-    p.Title,
-    VECTOR_DISTANCE('cosine', @query_vector, qe.embeddings) AS distance
-FROM dbo.QuestionEmbeddings qe
-JOIN dbo.Posts p ON qe.PostId = p.Id
-ORDER BY distance;
+WITH nearest AS (
+    SELECT TOP (10)
+        qe.PostId,
+        VECTOR_DISTANCE('cosine', @query_vector, qe.embeddings) AS distance
+    FROM dbo.QuestionEmbeddings qe
+    ORDER BY distance
+)
+SELECT p.Id, p.Title, n.distance
+FROM nearest n
+JOIN dbo.Posts p ON p.Id = n.PostId
+ORDER BY n.distance;
 GO
 SET STATISTICS XML OFF;
 GO
 
 
 /* -----------------------------------------------------------------------------
-   5c. Cosine distance in practice — strong match vs. weak match
+   5c. [OPTIONAL] Cosine distance in practice — strong match vs. weak match
    -----------------------------------------------------------------------------
    Concrete numbers help you understand what "distance" means.
    A distance near 0.1 is a very strong match; near 0.5 is background noise.

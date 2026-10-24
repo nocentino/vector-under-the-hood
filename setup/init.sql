@@ -67,6 +67,11 @@ ELSE
     PRINT 'StackOverflow database already exists — skipping restore.';
 GO
 
+-- The backup restores at an older compatibility level. AI_GENERATE_CHUNKS
+-- (Demo 03) needs 170 or higher.
+ALTER DATABASE [StackOverflow] SET COMPATIBILITY_LEVEL = 170;
+GO
+
 
 /* =============================================================================
    STEP 2 — Register the Ollama embedding model
@@ -78,8 +83,8 @@ GO
 -- CREATE EXTERNAL MODEL is a named pointer to the embedding endpoint.
 -- LOCATION is the NGINX TLS reverse proxy (model-web:443) that sits in
 -- front of host Ollama. SQL Server 2025 requires HTTPS for external calls.
--- Swap this object for Azure OpenAI or OpenAI to change the model provider
--- without touching any query in the demo files.
+-- Point this object at a different Ollama model to change models without
+-- touching any query in the demo files (see Demo 03 Section 4c).
 IF NOT EXISTS (SELECT 1 FROM sys.external_models WHERE name = N'ollama')
 BEGIN
     PRINT 'Creating EXTERNAL MODEL ollama...';
@@ -208,7 +213,8 @@ GO
 
 -- The index enables Approximate Nearest Neighbor (ANN) search via
 -- VECTOR_SEARCH. Demo 02 compares ANN vs. exact kNN IO stats and recall.
--- MAXDOP 8 uses all available cores during the graph construction phase.
+-- MAXDOP is left off: SQL Server 2025 ignores it for vector index builds
+-- (documented known issue).
 IF NOT EXISTS (
     SELECT 1 FROM sys.indexes
     WHERE  name      = 'vec_idx'
@@ -217,7 +223,7 @@ IF NOT EXISTS (
 BEGIN
     PRINT 'Building DiskANN vector index (vec_idx)...';
     CREATE VECTOR INDEX vec_idx ON dbo.QuestionEmbeddings([embeddings])
-    WITH (metric = 'cosine', type = 'diskann', maxdop = 8);
+    WITH (metric = 'cosine', type = 'diskann');
     PRINT 'Vector index built.';
 END
 ELSE
@@ -253,6 +259,9 @@ GO
 -- Primary retrieval procedure used by rag-app.py and Demo 03.
 -- Accepts plain text; SQL Server handles embedding via AI_GENERATE_EMBEDDINGS.
 -- Returns only scalar columns (no VECTOR type) — clean for application use.
+-- Uses the DiskANN index when it exists and falls back to exact kNN while the
+-- index is dropped for maintenance. Must be created while vec_idx exists:
+-- CREATE PROCEDURE fails with Msg 42227 if VECTOR_SEARCH has no index.
 CREATE OR ALTER PROCEDURE dbo.find_similar_questions
     @prompt NVARCHAR(MAX),
     @top    INT = 5
@@ -263,19 +272,50 @@ BEGIN
     DECLARE @query_vector VECTOR(768) =
         AI_GENERATE_EMBEDDINGS(@prompt USE MODEL ollama);
 
-    SELECT TOP (@top)
-        p.Id                                                        AS post_id,
-        p.Title                                                     AS title,
-        qe.chunk                                                    AS context_chunk,
-        REPLACE(REPLACE(REPLACE(
-            ISNULL(p.Tags, N''), '><', ', '), '<', ''), '>', '')    AS tags,
-        p.Score                                                     AS community_score,
-        p.ViewCount                                                 AS view_count,
-        p.AnswerCount                                               AS answer_count,
-        VECTOR_DISTANCE('cosine', @query_vector, qe.embeddings)     AS distance
-    FROM dbo.QuestionEmbeddings qe
-    JOIN dbo.Posts              p  ON p.Id = qe.PostId
-    ORDER BY distance;
+    IF EXISTS (SELECT 1 FROM sys.vector_indexes
+               WHERE object_id = OBJECT_ID('dbo.QuestionEmbeddings'))
+        SELECT
+            p.Id                                                        AS post_id,
+            p.Title                                                     AS title,
+            qe.chunk                                                    AS context_chunk,
+            REPLACE(REPLACE(REPLACE(
+                ISNULL(p.Tags, N''), '><', ', '), '<', ''), '>', '')    AS tags,
+            p.Score                                                     AS community_score,
+            p.ViewCount                                                 AS view_count,
+            p.AnswerCount                                               AS answer_count,
+            s.distance                                                  AS distance,
+            'ANN'                                                       AS search_path
+        FROM VECTOR_SEARCH(
+            TABLE      = dbo.QuestionEmbeddings AS qe,
+            COLUMN     = [embeddings],
+            SIMILAR_TO = @query_vector,
+            METRIC     = 'cosine',
+            TOP_N      = @top
+        ) AS s
+        JOIN dbo.Posts p ON p.Id = qe.PostId
+        ORDER BY s.distance;
+    ELSE
+        SELECT
+            p.Id                                                        AS post_id,
+            p.Title                                                     AS title,
+            n.chunk                                                     AS context_chunk,
+            REPLACE(REPLACE(REPLACE(
+                ISNULL(p.Tags, N''), '><', ', '), '<', ''), '>', '')    AS tags,
+            p.Score                                                     AS community_score,
+            p.ViewCount                                                 AS view_count,
+            p.AnswerCount                                               AS answer_count,
+            n.distance                                                  AS distance,
+            'kNN'                                                       AS search_path
+        FROM (
+            SELECT TOP (@top)
+                qe.PostId,
+                qe.chunk,
+                VECTOR_DISTANCE('cosine', @query_vector, qe.embeddings) AS distance
+            FROM dbo.QuestionEmbeddings qe
+            ORDER BY distance
+        ) AS n
+        JOIN dbo.Posts p ON p.Id = n.PostId
+        ORDER BY n.distance;
 END;
 GO
 
@@ -336,6 +376,7 @@ GO
 GRANT EXECUTE ON dbo.find_similar_questions TO rag_app;
 GRANT EXECUTE ON dbo.get_top_answer         TO rag_app;
 GRANT EXECUTE ON EXTERNAL MODEL::ollama     TO rag_app;
+GRANT VIEW DEFINITION ON dbo.QuestionEmbeddings TO rag_app;  -- lets the proc see vec_idx in sys.vector_indexes
 GO
 
 USE [master];

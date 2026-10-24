@@ -8,8 +8,8 @@
 #
 #   bash setup/expand-embeddings.sh
 #
-# Timing reference (Apple Silicon M-series, Ollama GPU acceleration):
-#   ~15 sec per 100 embeddings  →  ~15 minutes for the full 10,000
+# Timing reference (Apple Silicon M2, Ollama on the host):
+#   ~20 sec per 100 embeddings  →  ~30 minutes for the full 10,000
 #
 # The script is idempotent — safe to re-run or resume after a failure.
 # The NOT EXISTS guard in each INSERT batch skips already-embedded rows.
@@ -77,8 +77,8 @@ echo ""
 
 embed_start=$(date +%s)
 batch_num=0
-total=$(run_sql -Q "SET NOCOUNT ON; SELECT CAST(COUNT(*) AS VARCHAR(10)) FROM dbo.QuestionEmbeddings; GO" 2>&1 \
-    | grep -E '^\s*[0-9]+\s*$' | tail -1 | tr -d ' ')
+total=$(run_sql -h -1 -W -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM dbo.QuestionEmbeddings;" 2>&1 \
+    | grep -E '^\s*[0-9]+\s*$' | tail -1 | tr -d ' ' || true)
 total=${total:-0}
 echo "[$(date '+%H:%M:%S')]  Starting at $total rows."
 
@@ -103,9 +103,10 @@ SELECT q.Id, q.chunk, AI_GENERATE_EMBEDDINGS(q.chunk USE MODEL ollama) FROM nq q
 GO
 SET NOCOUNT ON;
 SELECT CAST(COUNT(*) AS VARCHAR(10)) FROM dbo.QuestionEmbeddings;
-GO" 2>&1)
+GO" 2>&1 || true)
 
-    total=$(echo "$result" | grep -E '^\s*[0-9]+\s*$' | tail -1 | tr -d ' ')
+    total=$(echo "$result" | grep -E '^\s*[0-9]+\s*$' | tail -1 | tr -d ' ' || true)
+    total=${total:-0}
 
     if echo "$result" | grep -q "31629"; then
         echo "[$(date '+%H:%M:%S')] Batch $batch_num: REST timeout — retrying (rows still: ${total:-?})"
@@ -125,7 +126,7 @@ index_start=$(date +%s)
 
 run_sql -Q "
 CREATE VECTOR INDEX vec_idx ON dbo.QuestionEmbeddings([embeddings])
-WITH (metric = 'cosine', type = 'diskann', maxdop = 8);
+WITH (metric = 'cosine', type = 'diskann');
 GO
 SELECT 'Vector index built over ' + CAST(COUNT(*) AS VARCHAR(10)) + ' rows.' AS status
 FROM dbo.QuestionEmbeddings;

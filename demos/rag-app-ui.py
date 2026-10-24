@@ -12,7 +12,7 @@ Architecture (same as rag-app.py, wrapped in a Streamlit chat interface):
         ▼
     SQL Server 2025 — dbo.find_similar_questions
         ├── AI_GENERATE_EMBEDDINGS  (SQL Server → Ollama)
-        ├── VECTOR_DISTANCE cosine
+        ├── VECTOR_SEARCH (DiskANN), exact kNN while the index is rebuilt
         └── TOP K results
         │
         ▼
@@ -30,6 +30,7 @@ Architecture (same as rag-app.py, wrapped in a Streamlit chat interface):
 
 import html
 import html.parser
+import os
 import re
 import time
 from typing import Optional
@@ -41,12 +42,12 @@ import streamlit as st
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-SQL_SERVER   = "localhost,1435"
+SQL_SERVER   = os.environ.get("SQL_SERVER", "localhost,1435")
 SQL_DATABASE = "StackOverflow"
 SQL_USER     = "rag_app"
 SQL_PASSWORD = "RagP@ss2025!"
 
-OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 LLM_MODEL       = "llama3.2"   # must be pulled: `ollama pull llama3.2`
 
 TOP_K            = 5
@@ -240,7 +241,7 @@ with st.sidebar:
     st.markdown("""
 1. Your question → **SQL Server**
 2. SQL Server calls **Ollama** to embed the text
-3. `VECTOR_DISTANCE` ranks all stored embeddings
+3. `VECTOR_SEARCH` walks the DiskANN graph (exact kNN if the index is dropped)
 4. Top answers fetched from `dbo.Posts`
 5. RAG prompt assembled and sent to **llama3.2**
 6. Answer streamed back here
@@ -296,7 +297,8 @@ if question := st.chat_input("Ask a programming question…"):
 
             total_db_ms = (time.perf_counter() - t0) * 1000
             status.update(
-                label=f"Retrieved {len(similar)} results in {total_db_ms:.0f} ms",
+                label=f"Retrieved {len(similar)} results in {total_db_ms:.0f} ms "
+                      f"({similar[0].get('search_path', '?') if similar else '-'})",
                 state="complete",
             )
 

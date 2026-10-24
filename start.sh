@@ -90,6 +90,6 @@ Then open the demos in order:
     demos/03-application-architecture.sql# schema design, RAG procs, security
 
 Run the Python RAG app:
-    pip install -r requirements.txt
-    python demos/rag-app.py
+    docker compose run --rm rag-app python demos/rag-app.py "how do I undo my last git commit?"
+    docker compose --profile app up rag-app-ui      # http://localhost:8501
 EOF

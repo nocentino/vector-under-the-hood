@@ -12,7 +12,7 @@ User question
     ▼
 SQL Server 2025 — dbo.find_similar_questions
     ├── AI_GENERATE_EMBEDDINGS   ← SQL Server calls Ollama to embed the query
-    ├── VECTOR_DISTANCE (cosine) ← ranks all stored embeddings
+    ├── VECTOR_SEARCH (DiskANN)  ← ANN graph walk; exact kNN if the index is dropped
     └── TOP (K) results          ← returns the closest K questions + chunk text
     │
     ▼
@@ -61,6 +61,7 @@ Usage
 
 import html
 import html.parser
+import os
 import re
 import sys
 import textwrap
@@ -73,17 +74,17 @@ import requests
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-SQL_SERVER   = "localhost,1435"
+SQL_SERVER   = os.environ.get("SQL_SERVER", "localhost,1435")
 SQL_DATABASE = "StackOverflow"
 SQL_USER     = "rag_app"
 SQL_PASSWORD = "RagP@ss2025!"
 
-OLLAMA_BASE_URL  = "http://localhost:11434"
+OLLAMA_BASE_URL  = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 LLM_MODEL        = "llama3.2"   # must be pulled: `ollama pull llama3.2`
 
 TOP_K            = 5            # number of similar questions to retrieve
 MAX_ANSWER_CHARS = 800          # characters of answer body to include in context
-REQUEST_TIMEOUT  = 120          # seconds to wait for the LLM response
+REQUEST_TIMEOUT  = 300          # seconds to wait for the LLM response (first load is slow)
 
 
 # ─── HTML helper ──────────────────────────────────────────────────────────────
@@ -154,7 +155,7 @@ def find_similar_questions(
 
     SQL Server handles:
       - Embedding @prompt via AI_GENERATE_EMBEDDINGS (calls host Ollama)
-      - VECTOR_DISTANCE cosine search over all stored embeddings
+      - VECTOR_SEARCH over the DiskANN index (exact kNN while it's rebuilt)
       - Returning the top-K most semantically similar questions
 
     The application sends plain text.  The embedding and vector search are
@@ -305,7 +306,8 @@ def answer_question(user_question: str) -> None:
             return
 
         retrieval_ms = (time.perf_counter() - t0) * 1000
-        print(f"      Retrieved {len(similar)} results in {retrieval_ms:.0f} ms")
+        path = similar[0].get("search_path", "?")
+        print(f"      Retrieved {len(similar)} results in {retrieval_ms:.0f} ms ({path})")
         print()
         for q in similar:
             print(f"  [{q['distance']:.3f}]  {q['title']}")
