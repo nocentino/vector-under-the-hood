@@ -26,13 +26,7 @@ GO
 
   Run the sections top to bottom. Every one is idempotent.
 
-  TIME BUDGET: 20 of the 60 demo minutes (75-minute slot, 15 for Q&A).
-    1   schema + chunking          4 min
-    2   RAG procs                  5 min
-    3   security                   3 min
-    4a  maintenance cycle          4 min
-    5   run the app                4 min
-    [OPTIONAL] 4b model swap (needs a second Ollama model pulled).
+  Section 4b is [OPTIONAL] and needs a second Ollama model pulled.
 =============================================================================
 */
 
@@ -199,6 +193,14 @@ SELECT AnswerId, COUNT(*) AS chunks, SUM(LEN(chunk)) AS total_chars
 FROM dbo.AnswerChunks
 GROUP BY AnswerId;
 GO
+
+SELECT
+  AnswerId,
+  chunk_order,
+  chunk
+FROM dbo.AnswerChunks
+ORDER BY AnswerId, chunk_order;
+GO
 -- In production, strip the HTML before chunking. The model embeds the tags too.
 
 
@@ -239,9 +241,13 @@ GO
    then walks the DiskANN graph with VECTOR_SEARCH.
 
    Here's the catch on SQL Server 2025: VECTOR_SEARCH with no vector index
-   fails with Msg 42227. During the drop-insert-rebuild cycle (Section 4a)
-   there's no index. So the proc checks sys.vector_indexes and falls back to
-   exact kNN with VECTOR_DISTANCE.
+  fails with Msg 42227. During the drop-insert-rebuild cycle (Section 4a)
+  there's no index. By default, the proc checks sys.vector_indexes and uses
+  ANN when the index exists, or exact kNN with VECTOR_DISTANCE when it doesn't.
+
+  You can override that with @search_mode: AUTO (the default), ANN, or KNN.
+  ANN raises Msg 50002 if the index is missing. KNN always forces the exact
+  scan, which is handy when you're comparing recall or performance.
 
    One more gotcha: CREATE PROCEDURE itself fails with Msg 42227 if the
    index doesn't exist at create time. After that, dropping the index is
@@ -256,17 +262,30 @@ GO
 
 CREATE OR ALTER PROCEDURE dbo.find_similar_questions
     @prompt NVARCHAR(MAX),
-    @top    INT = 5
+  @top    INT = 5,
+    @search_mode VARCHAR(10) = 'AUTO'
 AS
 BEGIN
     SET NOCOUNT ON;
+
+    DECLARE @mode VARCHAR(10) = UPPER(LTRIM(RTRIM(@search_mode)));
+
+    IF @mode IS NULL OR @mode NOT IN ('AUTO', 'ANN', 'KNN')
+        THROW 50001, 'Invalid @search_mode. Use AUTO, ANN, or KNN.', 1;
+
+    DECLARE @has_index BIT = CASE WHEN EXISTS (
+        SELECT 1 FROM sys.vector_indexes
+        WHERE object_id = OBJECT_ID('dbo.QuestionEmbeddings')
+    ) THEN 1 ELSE 0 END;
+
+    IF @mode = 'ANN' AND @has_index = 0
+        THROW 50002, 'ANN search requires a vector index on dbo.QuestionEmbeddings.', 1;
 
     -- SQL Server makes the embedding call. The app sends plain text.
     DECLARE @query_vector VECTOR(768) =
         AI_GENERATE_EMBEDDINGS(@prompt USE MODEL ollama);
 
-    IF EXISTS (SELECT 1 FROM sys.vector_indexes
-               WHERE object_id = OBJECT_ID('dbo.QuestionEmbeddings'))
+    IF @mode = 'ANN' OR (@mode = 'AUTO' AND @has_index = 1)
         SELECT
             p.Id                                                        AS post_id,
             p.Title                                                     AS title,
@@ -312,15 +331,24 @@ BEGIN
 END;
 GO
 
--- Let's test it directly. This is exactly what the Python app calls:
+-- AUTO picks ANN when vec_idx exists and exact kNN when it doesn't.
 EXEC dbo.find_similar_questions
     @prompt = N'my Python script is really slow on large files, how do I speed it up?',
-    @top    = 5;
+  @top    = 5,
+  @search_mode = 'AUTO';
+GO
+
+-- Force each path when you're comparing recall or performance.
+EXEC dbo.find_similar_questions
+    @prompt = N'I keep getting merge conflicts, what is the right workflow?',
+    @top    = 5,
+    @search_mode = 'ANN';
 GO
 
 EXEC dbo.find_similar_questions
     @prompt = N'I keep getting merge conflicts, what is the right workflow?',
-    @top    = 5;
+    @top    = 5,
+    @search_mode = 'KNN';
 GO
 
 
@@ -487,8 +515,8 @@ GO
    Managed Instance (Always-up-to-date) don't need it: their latest-version
    index supports DML and maintains itself in the background.
 
-   LIVE-DEMO TIP: step 3 rebuilds the index over ~10,000 rows, which takes
-   up to two minutes. Start it, then walk through the Section 5 diagram.
+   Heads up: step 3 rebuilds the index over ~10,000 rows, which can take a
+   couple of minutes.
 ----------------------------------------------------------------------------- */
 
 USE [StackOverflow];

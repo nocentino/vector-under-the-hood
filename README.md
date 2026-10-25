@@ -129,9 +129,9 @@ version and more detail.
 
 ## The Demos
 
-Each demo lines up with one of the session's learning objectives. Sections marked
-**[OPTIONAL]** in the scripts are deeper dives. Skip them on a first pass and come back
-when you want more detail.
+Each demo lines up with one of the session's learning objectives. Start with the core
+scripts. Optional deep dives live in separate files, so you can keep going when you want
+more detail.
 
 ### Demo 01: Vector Internals ([demos/01-vector-internals.sql](demos/01-vector-internals.sql))
 
@@ -142,12 +142,12 @@ How a vector is stored and how SQL Server runs an exact similarity search.
 | 1a | The `VECTOR` type in `sys.types` and `sys.columns` |
 | 1b | `DATALENGTH`: an 8-byte header plus 768 × 4 bytes, so 3,080 bytes per vector |
 | 1c | What your client sees (a JSON array) versus what SQL Server stores (binary) |
-| 1d | [OPTIONAL] Whether vectors stay in the row, proven with allocation units and `DBCC PAGE` |
-| 1e | Half-precision `VECTOR(n, float16)`: 2 bytes per element and a 3,996-dimension ceiling |
-| 2 | [OPTIONAL] Putting vectors on their own filegroup |
-| 3 | `AI_GENERATE_EMBEDDINGS` and the HTTPS round trip to Ollama |
-| 4 | `VECTOR_DISTANCE` with cosine, euclidean, and dot; `VECTOR_NORM` |
-| 5 | The exact kNN execution plan, and why you rank before you join |
+| 2 | `AI_GENERATE_EMBEDDINGS` and the HTTPS round trip to Ollama |
+| 3 | `VECTOR_DISTANCE` with cosine, euclidean, and dot; `VECTOR_NORM` |
+| 4 | Exact kNN: the table scan and execution plan |
+
+For the optional storage, float16, filegroup, and distance deep dives, run
+[demos/01-vector-internals-optional.sql](demos/01-vector-internals-optional.sql).
 
 ### Demo 02: Index Performance ([demos/02-index-performance.sql](demos/02-index-performance.sql))
 
@@ -157,12 +157,15 @@ What the DiskANN index is, what it costs, and where it helps and where it doesn'
 |---|---|
 | 1 | How DiskANN and its Vamana graph work, the build, and where the graph is stored |
 | 2 | Reads and CPU for an exact scan versus the index, and how each one grows with row count |
+| 2a | Scale: how exact kNN and ANN change as the row count grows |
 | 3 | Recall: how often the index finds the same answers as an exact search |
 | 4a | The table goes read-only while the index exists (Msg 42231 and 42232) |
-| 4b to 4e | [OPTIONAL] Filtered search, dimension limits, build cost, and the `Vector Index Seek` plan |
-| 4f | A filter that silently returns zero rows, how to spot it, and how to fix it |
-| 4g | The other documented limits: INT clustered key, no temp tables, no partitioning |
-| 5 | The newer DiskANN on Azure SQL Database, Fabric, and Managed Instance |
+| 4b | A filter that silently returns zero rows, how to spot it, and how to fix it |
+| 4c | The documented limits: INT clustered key, no temp tables, no partitioning |
+
+For filtered-search details, dimension limits, build diagnostics, execution plans, and
+the latest Azure DiskANN version, see
+[demos/02-index-performance-optional.sql](demos/02-index-performance-optional.sql).
 
 ### Demo 03: Application Architecture ([demos/03-application-architecture.sql](demos/03-application-architecture.sql))
 
@@ -184,6 +187,9 @@ The patterns behind a working RAG app, then the app itself.
 The app takes your question, asks SQL Server for the most similar StackOverflow
 questions and their best answers, and hands that context to `llama3.2` to write an
 answer. SQL Server does the embedding and the search. The app never touches a vector.
+The procedure defaults to `AUTO`: it uses ANN when the index exists and exact kNN
+when it doesn't. You can pass `@search_mode = 'ANN'` or `'KNN'` to force a path for
+comparison; `ANN` returns Msg 50002 if the index is missing.
 
 It runs in a container, so you don't need Python or an ODBC driver on your machine.
 The image builds the first time you run it.
@@ -277,14 +283,14 @@ NGINX sits in between and adds the TLS. That's the only reason `model-web` exist
 | Feature | Where |
 |---|---|
 | `VECTOR(n)` data type | All three demos |
-| `VECTOR(n, float16)` half precision (preview) | Demo 01 §1e |
-| `AI_GENERATE_EMBEDDINGS` | Demo 01 §3, Demo 03 |
+| `VECTOR(n, float16)` half precision (preview) | Demo 01 optional Appendix B |
+| `AI_GENERATE_EMBEDDINGS` | Demo 01 §2, Demo 03 |
 | `AI_GENERATE_CHUNKS` | Demo 03 §1c |
-| `VECTOR_DISTANCE` and `VECTOR_NORM` | Demo 01 §4 |
+| `VECTOR_DISTANCE` and `VECTOR_NORM` | Demo 01 §3 |
 | `CREATE VECTOR INDEX` (DiskANN, preview) | Demo 02 §1 |
 | `VECTOR_SEARCH` | Demo 02 §2, Demo 03 §2 |
-| `CREATE EXTERNAL MODEL` with Ollama | Demo 01 §3, Demo 03 |
-| `SELECT TOP (N) WITH APPROXIMATE`, `sys.dm_db_vector_indexes` | Demo 02 §5, shown for Azure only |
+| `CREATE EXTERNAL MODEL` with Ollama | Demo 01 §2, Demo 03 |
+| `SELECT TOP (N) WITH APPROXIMATE`, `sys.dm_db_vector_indexes` | Demo 02 optional Appendix E, Azure only |
 
 ---
 
@@ -299,7 +305,7 @@ Here are the problems I hit while building this, and what fixes them.
 | **Msg 42227**, "Cannot find a vector index" | `VECTOR_SEARCH` needs a vector index on SQL Server 2025. Rebuild the index. |
 | The app always says `kNN` | The vector index is missing, or the app login lost `VIEW DEFINITION` on `dbo.QuestionEmbeddings`. |
 | `sql-init` exited with a non-zero code | Check `docker logs sql-init`. It's usually Ollama not being reachable from Docker. |
-| SSMS says "'Vector Index Seek' is not a valid value for PhysicalOpType" | Your SSMS is older than the operator. Update it, or use the plan cache query in Demo 02 §4e. |
+| SSMS says "'Vector Index Seek' is not a valid value for PhysicalOpType" | Your SSMS is older than the operator. Update it, or use the plan cache query in Demo 02 optional Appendix D. |
 | Everything is slow right after Docker restarts | Nothing is cached yet. The first index build after a restart took me up to 6 minutes. Run it once and it settles down. |
 
 ---

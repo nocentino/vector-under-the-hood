@@ -264,20 +264,34 @@ GO
 -- You pass in plain text and SQL Server embeds it via AI_GENERATE_EMBEDDINGS.
 -- It returns only scalar columns (no VECTOR type), so the app gets clean rows.
 -- It uses the DiskANN index when it exists and falls back to exact kNN while
--- the index is dropped for maintenance. Create it while vec_idx exists, since
--- CREATE PROCEDURE fails with Msg 42227 if VECTOR_SEARCH has no index.
+-- the index is dropped for maintenance. @search_mode defaults to AUTO; ANN
+-- requires an index, and KNN forces the exact scan. Create it while vec_idx
+-- exists, since CREATE PROCEDURE fails with Msg 42227 without the index.
 CREATE OR ALTER PROCEDURE dbo.find_similar_questions
     @prompt NVARCHAR(MAX),
-    @top    INT = 5
+    @top    INT = 5,
+    @search_mode VARCHAR(10) = 'AUTO'
 AS
 BEGIN
     SET NOCOUNT ON;
 
+    DECLARE @mode VARCHAR(10) = UPPER(LTRIM(RTRIM(@search_mode)));
+
+    IF @mode IS NULL OR @mode NOT IN ('AUTO', 'ANN', 'KNN')
+        THROW 50001, 'Invalid @search_mode. Use AUTO, ANN, or KNN.', 1;
+
+    DECLARE @has_index BIT = CASE WHEN EXISTS (
+        SELECT 1 FROM sys.vector_indexes
+        WHERE object_id = OBJECT_ID('dbo.QuestionEmbeddings')
+    ) THEN 1 ELSE 0 END;
+
+    IF @mode = 'ANN' AND @has_index = 0
+        THROW 50002, 'ANN search requires a vector index on dbo.QuestionEmbeddings.', 1;
+
     DECLARE @query_vector VECTOR(768) =
         AI_GENERATE_EMBEDDINGS(@prompt USE MODEL ollama);
 
-    IF EXISTS (SELECT 1 FROM sys.vector_indexes
-               WHERE object_id = OBJECT_ID('dbo.QuestionEmbeddings'))
+    IF @mode = 'ANN' OR (@mode = 'AUTO' AND @has_index = 1)
         SELECT
             p.Id                                                        AS post_id,
             p.Title                                                     AS title,
