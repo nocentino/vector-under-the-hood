@@ -236,94 +236,10 @@ SELECT
 GO
 
 /* -----------------------------------------------------------------------------
-    APPENDIX D. EXECUTION PLAN ANATOMY: the Vector Index Seek operator
+    APPENDIX D. Execution plan anatomy: the Vector Index Seek operator
    -----------------------------------------------------------------------------
-   VECTOR_SEARCH brings its own plan operator. It isn't a Clustered Index
-   Scan (full table read) or a B-tree Index Seek (point/range lookup). It's:
-
-       Vector Index Seek
-
-   Read the plan in SSMS (Ctrl+M) or query sys.dm_exec_cached_plans directly.
-   Here's the ANN plan shape:
-
-       Top
-        └─ Nested Loops
-            ├─ Nested Loops
-            │   ├─ Vector Index Seek     ← DiskANN graph walk, returns TOP_N keys
-            │   └─ Clustered Index Seek  ← QuestionEmbeddings row lookup
-            └─ Clustered Index Seek      ← Posts row lookup
-
-    Compare that to the exact kNN plan from Demo 01 Section 4 (no vector index):
-
-       Top N Sort
-        └─ Compute Scalar            ← VECTOR_DISTANCE computed for every row
-            └─ Clustered Index Scan  ← full CI scan over every row
-
-   Section 2 has the measured page counts for both paths.
-
-   If SSMS says "'Vector Index Seek' is not a valid value for PhysicalOpType",
-   your client's showplan schema predates the operator. Update SSMS, or use
-   the plan cache query below, which reads the XML on the server.
+   Moved into the core script: see demos/02-index-performance.sql, §2-plan.
 ----------------------------------------------------------------------------- */
--- Run this, then open the actual execution plan in SSMS (Ctrl+M before running):
-
-DECLARE @qv VECTOR(768) = AI_GENERATE_EMBEDDINGS(
-    N'how do I undo my last git commit?' USE MODEL ollama
-);
-SELECT TOP(5) /* demo-4e */
-    t.PostId,
-    p.Title,
-    s.distance,
-    p.Score
-FROM VECTOR_SEARCH(
-    TABLE      = dbo.QuestionEmbeddings AS t,
-    COLUMN     = [embeddings],
-    SIMILAR_TO = @qv,
-    METRIC     = 'cosine',
-    TOP_N      = 5
-) AS s
-JOIN dbo.Posts p ON t.PostId = p.Id
-ORDER BY s.distance;
-GO
-
--- WHAT TO LOOK FOR in the graphical plan (node numbers match the query below):
---   Node 0   Top                    enforces the 5-row limit
---   Node 1-2 Nested Loops           for each ANN result, fetch the rows
---   Node 3   Vector Index Seek      the graph walk on 'vec_idx', cost ~0.13
---   Node 36  Clustered Index Seek   QuestionEmbeddings lookup
---   Node 37  Clustered Index Seek   Posts lookup
-
--- Query the plan cache directly to see the operator tree without SSMS:
-SET QUOTED_IDENTIFIER ON;
-GO
-SELECT
-    r.value('@NodeId',                    'INT')           AS node_id,
-    r.value('@PhysicalOp',                'NVARCHAR(100)') AS physical_op,
-    ROUND(r.value('@EstimateRows',        'FLOAT'), 1)     AS est_rows,
-    ROUND(r.value('@EstimatedTotalSubtreeCost', 'FLOAT'), 4) AS subtree_cost
-FROM sys.dm_exec_cached_plans cp
-CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) st
-CROSS APPLY sys.dm_exec_query_plan(cp.plan_handle) qp
-CROSS APPLY qp.query_plan.nodes(
-    'declare namespace x="http://schemas.microsoft.com/sqlserver/2004/07/showplan";
-     //x:RelOp') AS n(r)
-WHERE st.text LIKE N'%demo-4e%'                       -- the marker in the query above
-  AND st.text NOT LIKE N'%dm_exec_cached_plans%'      -- not this query
-ORDER BY node_id;
-GO
-
--- EXPECTED OUTPUT:
---   node_id  physical_op           est_rows  subtree_cost
---   -------  --------------------  --------  ------------
---         0  Top                        1.0        0.1355
---         1  Nested Loops               1.0        0.1355
---         2  Nested Loops               1.0        0.1322
---         3  Vector Index Seek          1.0        0.1289   ← DiskANN
---        36  Clustered Index Seek       1.0        0.0033   ← QuestionEmbeddings lookup
---        37  Clustered Index Seek       1.0        0.0033   ← Posts lookup
---
--- Notice est_rows = 1.0 on the Vector Index Seek even though it returns 5.
--- The optimizer doesn't estimate vector search cardinality well yet.
 
 /* =============================================================================
     APPENDIX E. LATEST-VERSION DiskANN: WHAT'S NEW (Azure SQL DB / Fabric)
@@ -593,9 +509,38 @@ FROM (VALUES
     ('Full DML (no read-only restriction)',    'Drop-insert-rebuild',      'GA'),
     ('Iterative filtering (predicate in walk)','Manual oversampling',      'GA'),
     ('SELECT TOP (N) WITH APPROXIMATE syntax', 'Not supported (use TOP_N)','GA'),
-    ('sys.dm_db_vector_indexes DMV',           'Not on CU10',              'GA'),
+    ('sys.dm_db_vector_indexes DMV',           'Not on this build (CU5, CU10)',              'GA'),
     ('Async background index maintenance',     'Not available',            'GA'),
     ('Vector index overall',                   'Preview',                  'GA')
 ) AS t(feature, sql_server_2025_onprem, azure_latest_version);
 -- azure_latest_version = Azure SQL DB, SQL database in Fabric, and Azure SQL
 -- Managed Instance with the Always-up-to-date update policy.
+
+
+/* =============================================================================
+   APPENDIX F. DUPLICATE EMBEDDINGS
+   =============================================================================
+
+   The CREATE VECTOR INDEX docs say not to index datasets with a high share
+   of duplicate vectors. Duplicates crowd real neighbors out of the results,
+   waste build time, and add maintenance cost for no benefit. Deduplicate
+   before you build.
+
+   You can't GROUP BY a VECTOR column, so use the text that was embedded as
+   the proxy. Identical chunks give identical vectors from the same model.
+   ============================================================================= */
+
+SELECT
+    COUNT(*)                                         AS total_rows,
+    COUNT(DISTINCT qe.chunk)                         AS distinct_chunks,
+    COUNT(*) - COUNT(DISTINCT qe.chunk)              AS duplicate_rows
+FROM dbo.QuestionEmbeddings qe;
+GO
+
+-- The worst offenders:
+SELECT TOP (10) qe.chunk, COUNT(*) AS copies
+FROM dbo.QuestionEmbeddings qe
+GROUP BY qe.chunk
+HAVING COUNT(*) > 1
+ORDER BY copies DESC;
+GO

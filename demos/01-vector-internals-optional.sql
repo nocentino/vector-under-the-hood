@@ -16,63 +16,10 @@ USE [StackOverflow];
 GO
 
 /* -----------------------------------------------------------------------------
-   APPENDIX A. Page-level storage: where does the vector actually live?
+   APPENDIX A. Page-level storage
    -----------------------------------------------------------------------------
-   A VECTOR(768) is 3,080 bytes. A data page holds about 8,060 bytes of row
-   data. So the question is: does the vector stay in the row, or does it get
-   pushed off to another page?
-
-   Here's the documented rule from the Pages and Extents Architecture Guide:
-   "When the total row size exceeds the 8,060-byte limitation, the Database
-   Engine dynamically moves one or more variable length columns to pages in a
-   ROW_OVERFLOW_DATA allocation unit, starting with the widest column."
-     https://learn.microsoft.com/en-us/sql/relational-databases/pages-and-extents-architecture-guide
-
-   The VECTOR docs don't say anything about row-overflow, so let's measure it.
-   Our rows are PostId (4) + vector (3,080) + chunk (a title and tags, a few
-   hundred bytes at most). That's well under 8,060, so the vector stays
-   IN_ROW. Two rows fit on a page. You'll see closer to 1.5 rows per page,
-   though: we inserted in Score order, not PostId order, so page splits left
-   pages partly empty. A vector would only overflow if chunk grew past
-   roughly 4,900 bytes.
-
-   Why should you care? Every kNN scan reads every page. At ~1.5 rows per page a
-   full scan of 10,000 rows reads ~6,700 pages. That's the number you'll see
-   in STATISTICS IO in the core query section and Demo 02.
+   Moved into the core script: see demos/01-vector-internals.sql, §1b-2.
 ----------------------------------------------------------------------------- */
-
--- Which allocation units hold the table's data? ROW_OVERFLOW_DATA stays at 0.
-SELECT
-    au.type_desc            AS allocation_unit,
-    au.total_pages,
-    au.data_pages,
-    p.rows,
-    CAST(p.rows * 1.0 / NULLIF(au.data_pages, 0) AS DECIMAL(5,2)) AS rows_per_page
-FROM sys.partitions       p
-JOIN sys.allocation_units au ON au.container_id = p.hobt_id
-WHERE p.object_id = OBJECT_ID('dbo.QuestionEmbeddings')
-  AND p.index_id  = 1;
-GO
-
--- The largest row we store, in bytes:
-SELECT MAX(4 + DATALENGTH(embeddings) + DATALENGTH(chunk)) AS max_row_payload_bytes
-FROM dbo.QuestionEmbeddings;
-GO
-
--- DBCC PAGE is undocumented. Use it to look, never in production code.
--- fn_PhysLocCracker gives the file, page, and slot for a row.
-DECLARE @file INT, @page INT, @sql NVARCHAR(200);
-SELECT TOP (1) @file = plc.file_id, @page = plc.page_id
-FROM dbo.QuestionEmbeddings qe
-CROSS APPLY sys.fn_PhysLocCracker(%%physloc%%) AS plc;
-
-SET @sql = CONCAT(N'DBCC PAGE(''StackOverflow'', ', @file, N', ', @page, N', 3);');
-DBCC TRACEON(3604);   -- send DBCC output to the Messages tab
-EXEC (@sql);
-DBCC TRACEOFF(3604);
-GO
--- In the Messages tab, look for m_slotCnt in the page header (1 or 2) and
--- the slots, each carrying a ~3 KB vector inline.
 
 /* =============================================================================
    APPENDIX B. HALF-PRECISION VECTORS, VECTOR(n, float16)

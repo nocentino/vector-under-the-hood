@@ -43,6 +43,7 @@ SQL Server applications, this one's for you. Let's go.
 | **Docker Desktop** | 4.x or later, running |
 | **Ollama** | Installed from [ollama.com/download](https://ollama.com/download). `start.sh` pulls the models for you |
 | **Disk space** | About 4 GB for the SQL Server image and the StackOverflow backup, plus 2 GB for `llama3.2` |
+| **Disk for the scale test** | Optional. About 12 GB for the 1,000,000-row `StackOverflowScale` database (8 GB data file, plus a 3 GB backup in `backups/`) |
 | **`mxbai-embed-large`** | Optional. Only for the model swap in Demo 03 §4b (`ollama pull mxbai-embed-large`, about 670 MB) |
 
 You don't need Python or an ODBC driver on your machine. The RAG app runs in its own container.
@@ -97,23 +98,39 @@ batches of 100, then rebuilds the index. If you stop it partway, run it again an
 picks up where it left off. If three batches in a row fail, it stops and shows you the
 error. That's usually Ollama not running.
 
-Here's how long things took on my M2:
+Here's how long things took on my M2 (CU10, Ollama on the host, October 2026):
 
 | Step | Time |
 |---|:---:|
-| Embedding 100 questions | ~20 seconds |
-| Growing to 10,000 rows | ~30 minutes |
+| Embedding 100 questions | ~2 to 3 seconds |
+| Growing to 10,000 rows | ~4 minutes |
 | Building the vector index, 1,000 rows | ~11 seconds |
-| Building the vector index, 10,000 rows | 23 seconds to 2 minutes |
-| First index build after a restart | up to ~6 minutes |
+| Building the vector index, 10,000 rows | 10 to 12 seconds |
+| First index build after a restart | up to ~6 minutes (an earlier, slower run; I didn't see it again) |
 
-### Step 3: Run the demos
+### Step 3: Build the scale database (optional, for Demo 02 §2b)
+
+Demo 02 §2b measures exact search and the index at 1,000,000 rows. That lives in its
+own database, `StackOverflowScale`, so Demo 03's drop-and-rebuild never touches it:
+
+```bash
+bash setup/build-scale-db.sh             # build it
+bash setup/build-scale-db.sh --restore   # or restore the backup it wrote
+```
+
+Building takes about 80 minutes on my M2 (50 minutes to generate the rows and 27 minutes
+for the index), and it's safe to stop and rerun. It writes a 3 GB backup to `backups/`,
+so you only pay that once. The rows are synthetic: the 10,000 real embeddings from
+StackOverflow, each with 100 noisy copies. Use it for timing, reads, and recall, not for
+search quality.
+
+### Step 4: Run the demos
 
 Open the three demo scripts in SSMS or the MSSQL extension for VS Code, connect to
 `localhost,1435` as `sa`, and run them in order. Each script explains what you're
 looking at as you go. Run it a section at a time and read the comments.
 
-### Step 4: Try the RAG app
+### Step 5: Try the RAG app
 
 Start the web UI, then open [http://localhost:8501](http://localhost:8501) and ask it a
 programming question:
@@ -141,12 +158,13 @@ How a vector is stored and how SQL Server runs an exact similarity search.
 |---|---|
 | 1a | The `VECTOR` type in `sys.types` and `sys.columns` |
 | 1b | `DATALENGTH`: an 8-byte header plus 768 × 4 bytes, so 3,080 bytes per vector |
+| 1b-2 | Page-level storage: the vector stays in the row, about 1.5 rows per page, and `DBCC PAGE` |
 | 1c | What your client sees (a JSON array) versus what SQL Server stores (binary) |
 | 2 | `AI_GENERATE_EMBEDDINGS` and the HTTPS round trip to Ollama |
 | 3 | `VECTOR_DISTANCE` with cosine, euclidean, and dot; `VECTOR_NORM` |
 | 4 | Exact kNN: the table scan and execution plan |
 
-For the optional storage, float16, filegroup, and distance deep dives, run
+For the optional float16, filegroup, and distance deep dives, run
 [demos/01-vector-internals-optional.sql](demos/01-vector-internals-optional.sql).
 
 ### Demo 02: Index Performance ([demos/02-index-performance.sql](demos/02-index-performance.sql))
@@ -156,14 +174,17 @@ What the DiskANN index is, what it costs, and where it helps and where it doesn'
 | Section | What you'll see |
 |---|---|
 | 1 | How DiskANN and its Vamana graph work, the build, and where the graph is stored |
+| 1d | Which DiskANN version you're on, and why the `TOP_N` syntax here is the deprecated one |
 | 2 | Reads and CPU for an exact scan versus the index, and how each one grows with row count |
+| 2-plan | The execution plan: Vector Index Seek versus Clustered Index Scan |
 | 2a | Scale: how exact kNN and ANN change as the row count grows |
-| 3 | Recall: how often the index finds the same answers as an exact search |
+| 2b | Scale past the corpus: 1,000,000 rows in `StackOverflowScale`, reads and timing against Microsoft's ~50,000-vector guidance, and recall with and without oversampling |
+| 3 | Recall: averaged over 100 queries at K = 10 and K = 100, and what "at scale" means |
 | 4a | The table goes read-only while the index exists (Msg 42231 and 42232) |
 | 4b | A filter that silently returns zero rows, how to spot it, and how to fix it |
-| 4c | The documented limits: INT clustered key, no temp tables, no partitioning |
+| 4c | The documented limits: INT clustered key, the latest-version 100-row minimum, no temp tables, no partitioning |
 
-For filtered-search details, dimension limits, build diagnostics, execution plans, and
+For filtered-search details, dimension limits, build diagnostics, and
 the latest Azure DiskANN version, see
 [demos/02-index-performance-optional.sql](demos/02-index-performance-optional.sql).
 
@@ -175,9 +196,10 @@ The patterns behind a working RAG app, then the app itself.
 |---|---|
 | 1 | A separate embeddings table, and chunking long text with `AI_GENERATE_CHUNKS` |
 | 2 | A search proc that uses the index and falls back to an exact search when it's gone |
-| 3 | A least-privilege login for the app |
+| 3 | A least-privilege login for the app, and a live demo of it being denied |
 | 4a | Loading new data: drop the index, embed, rebuild, with the app working the whole time |
 | 4b | [OPTIONAL] Moving to a different embedding model side by side |
+| 4c | Monitoring and staleness checks, run as `dba_monitor`, and what to add next |
 | 5 | The full request flow, then the app answering questions |
 
 ---
@@ -245,9 +267,9 @@ without taking the app down:
 |---|---|
 | Server | `localhost,1435` |
 | SA password | `S0methingS@Str0ng!` |
-| Database | `StackOverflow` |
+| Database | `StackOverflow` (and `StackOverflowScale` if you built it) |
 | App login | `rag_app` / `RagP@ss2025!` |
-| Monitoring login | `dba_monitor` / `MonitorP@ss123!` |
+| Monitoring login | `dba_monitor` / `MonitorP@ss123!` (read-only, used in Demo 03 §4c) |
 
 The stack uses port 1435 so it won't collide with a SQL Server you already have on 1433.
 These passwords are for a local demo only. Don't reuse them anywhere real.
@@ -302,10 +324,12 @@ Here are the problems I hit while building this, and what fixes them.
 |---|---|
 | **Msg 31629**, "external rest endpoint execution exceeded the timeout" | Ollama isn't running, or the model is still loading. Warm it up with `curl -s http://localhost:11434/api/embed -d '{"model":"nomic-embed-text","input":"hi"}'` and try again. |
 | **Msg 42231 or 42232** on INSERT, UPDATE, DELETE, or TRUNCATE | That's expected. On SQL Server 2025 a table is read-only while it has a vector index. Drop the index, load your data, rebuild it. Demo 03 §4a shows how. |
+| **Msg 42266** on `CREATE VECTOR INDEX` | Latest-version indexes (Azure SQL) need at least 100 rows with non-NULL vectors. The earlier-version index on SQL Server 2025 doesn't enforce it. |
+| **Msg 42274** on `VECTOR_SEARCH` | You're on a latest-version index (Azure SQL) and used `TOP_N`. Use `SELECT TOP (N) WITH APPROXIMATE` instead. See Demo 02 §1d. |
 | **Msg 42227**, "Cannot find a vector index" | `VECTOR_SEARCH` needs a vector index on SQL Server 2025. Rebuild the index. |
 | The app always says `kNN` | The vector index is missing, or the app login lost `VIEW DEFINITION` on `dbo.QuestionEmbeddings`. |
 | `sql-init` exited with a non-zero code | Check `docker logs sql-init`. It's usually Ollama not being reachable from Docker. |
-| SSMS says "'Vector Index Seek' is not a valid value for PhysicalOpType" | Your SSMS is older than the operator. Update it, or use the plan cache query in Demo 02 optional Appendix D. |
+| SSMS says "'Vector Index Seek' is not a valid value for PhysicalOpType" | Your SSMS is older than the operator. Update it, or use the plan cache query in Demo 02 §2-plan. |
 | Everything is slow right after Docker restarts | Nothing is cached yet. The first index build after a restart took me up to 6 minutes. Run it once and it settles down. |
 
 ---
@@ -326,10 +350,11 @@ fresh, run `./stop.sh --wipe`, then `./start.sh` and `bash setup/expand-embeddin
 
 ```
 demos/        the three demo scripts, rag-app.py (CLI), and rag-app-ui.py (web UI)
-setup/        init.sql (run by sql-init) and expand-embeddings.sh
+setup/        init.sql (run by sql-init), expand-embeddings.sh, and build-scale-db.sh
 config/       nginx.conf for the TLS proxy
 certs/        generate_ssl.sh; the certificate is created on first start
-backups/      StackOverflowMini.bak, downloaded by start.sh and not in git
+backups/      StackOverflowMini.bak (downloaded by start.sh) and StackOverflowScale.bak
+              (written by build-scale-db.sh), neither in git
 docker-compose.yml, dockerfile.ssl, dockerfile.app, start.sh, stop.sh
 ```
 

@@ -58,7 +58,7 @@ services:
   # and DiskANN vector indexes all live here.
   sql1:
     platform: linux/amd64                             # runs under Rosetta on Apple Silicon
-    image: mcr.microsoft.com/mssql/server:2025-latest # CU1+ required for Apple Silicon AVX fix
+    image: mcr.microsoft.com/mssql/server:2025-CU10-ubuntu-24.04 # pinned to CU10 (CU1+ is required for the Apple Silicon AVX fix)
     container_name: sql1
     restart: unless-stopped
     depends_on:

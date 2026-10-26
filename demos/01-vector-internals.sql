@@ -143,6 +143,58 @@ GO
 
 
 /* -----------------------------------------------------------------------------
+   1b-2. Page-level storage: where does the vector actually live?
+   -----------------------------------------------------------------------------
+   A VECTOR(768) is 3,080 bytes. A data page holds about 8,060 bytes of row
+   data. So does the vector stay in the row, or get pushed to another page?
+
+   The documented rule (Pages and Extents Architecture Guide): when a row
+   exceeds 8,060 bytes, the engine moves variable-length columns to
+   ROW_OVERFLOW_DATA pages, starting with the widest column.
+     https://learn.microsoft.com/en-us/sql/relational-databases/pages-and-extents-architecture-guide
+
+   The VECTOR docs say nothing about row overflow, so let's measure it. Our
+   rows are PostId (4) + vector (3,080) + chunk (a title and tags, a few
+   hundred bytes). That's well under 8,060, so the vector stays IN_ROW. Two
+   rows could fit on a page. You'll see closer to 1.5 rows per page because
+   we inserted in Score order, not PostId order, and page splits left pages
+   partly empty. A vector would only overflow if chunk grew past ~4,900 bytes.
+
+   Why care? Every exact kNN scan reads every page. At ~1.5 rows per page, a
+   full scan of 10,000 rows reads ~6,700 pages. That's the number you'll see
+   in STATISTICS IO in §4 and in Demo 02.
+----------------------------------------------------------------------------- */
+
+-- Which allocation units hold the table's data? ROW_OVERFLOW_DATA stays absent.
+SELECT
+    au.type_desc            AS allocation_unit,
+    au.total_pages,
+    au.data_pages,
+    p.rows,
+    CAST(p.rows * 1.0 / NULLIF(au.data_pages, 0) AS DECIMAL(5,2)) AS rows_per_page
+FROM sys.partitions       p
+JOIN sys.allocation_units au ON au.container_id = p.hobt_id
+WHERE p.object_id = OBJECT_ID('dbo.QuestionEmbeddings')
+  AND p.index_id  = 1;
+GO
+
+-- DBCC PAGE is undocumented. Use it to look, never in production code.
+-- fn_PhysLocCracker gives the file, page, and slot for a row.
+DECLARE @file INT, @page INT, @sql NVARCHAR(200);
+SELECT TOP (1) @file = plc.file_id, @page = plc.page_id
+FROM dbo.QuestionEmbeddings qe
+CROSS APPLY sys.fn_PhysLocCracker(%%physloc%%) AS plc;
+
+SET @sql = CONCAT(N'DBCC PAGE(''StackOverflow'', ', @file, N', ', @page, N', 3);');
+DBCC TRACEON(3604);   -- send DBCC output to the Messages tab
+EXEC (@sql);
+DBCC TRACEOFF(3604);
+GO
+-- In the Messages tab, look for m_slotCnt in the page header (1 or 2) and the
+-- slots, each carrying a ~3 KB vector inline.
+
+
+/* -----------------------------------------------------------------------------
    1c. Binary storage: client representation vs internal format
    -----------------------------------------------------------------------------
    Internally, SQL Server stores VECTOR as compact binary (8-byte header +

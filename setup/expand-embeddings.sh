@@ -9,7 +9,7 @@
 #   bash setup/expand-embeddings.sh
 #
 # Timing reference (Apple Silicon M2, Ollama on the host):
-#   ~20 sec per 100 embeddings  →  ~30 minutes for the full 10,000
+#   ~2 to 3 sec per 100 embeddings  →  ~4 minutes for the full 10,000
 #
 # It's idempotent, so you can re-run it or resume after a failure.
 # The NOT EXISTS guard in each INSERT batch skips rows already embedded.

@@ -195,9 +195,9 @@ GROUP BY AnswerId;
 GO
 
 SELECT
-  AnswerId,
-  chunk_order,
-  chunk
+    AnswerId,
+    chunk_order,
+    chunk
 FROM dbo.AnswerChunks
 ORDER BY AnswerId, chunk_order;
 GO
@@ -241,13 +241,17 @@ GO
    then walks the DiskANN graph with VECTOR_SEARCH.
 
    Here's the catch on SQL Server 2025: VECTOR_SEARCH with no vector index
-  fails with Msg 42227. During the drop-insert-rebuild cycle (Section 4a)
-  there's no index. By default, the proc checks sys.vector_indexes and uses
-  ANN when the index exists, or exact kNN with VECTOR_DISTANCE when it doesn't.
+   fails with Msg 42227. During the drop-insert-rebuild cycle (Section 4a)
+   there's no index. By default, the proc checks sys.vector_indexes and uses
+   ANN when the index exists, or exact kNN with VECTOR_DISTANCE when it doesn't.
 
-  You can override that with @search_mode: AUTO (the default), ANN, or KNN.
-  ANN raises Msg 50002 if the index is missing. KNN always forces the exact
-  scan, which is handy when you're comparing recall or performance.
+   You can override that with @search_mode: AUTO (the default), ANN, or KNN.
+   ANN raises Msg 50002 if the index is missing. KNN always forces the exact
+   scan, which is handy when you're comparing recall or performance.
+
+   The docs say VECTOR_SEARCH with no matching index raises a warning and
+   falls back to kNN. On SQL Server 2025 CU10 it raises Msg 42227 instead, so
+   the proc has to make the choice itself.
 
    One more gotcha: CREATE PROCEDURE itself fails with Msg 42227 if the
    index doesn't exist at create time. After that, dropping the index is
@@ -262,7 +266,7 @@ GO
 
 CREATE OR ALTER PROCEDURE dbo.find_similar_questions
     @prompt NVARCHAR(MAX),
-  @top    INT = 5,
+    @top    INT = 5,
     @search_mode VARCHAR(10) = 'AUTO'
 AS
 BEGIN
@@ -334,8 +338,8 @@ GO
 -- AUTO picks ANN when vec_idx exists and exact kNN when it doesn't.
 EXEC dbo.find_similar_questions
     @prompt = N'my Python script is really slow on large files, how do I speed it up?',
-  @top    = 5,
-  @search_mode = 'AUTO';
+    @top    = 5,
+    @search_mode = 'AUTO';
 GO
 
 -- Force each path when you're comparing recall or performance.
@@ -482,6 +486,67 @@ GO
 --   Users, or anything else. All data access goes through the procs.
 --   That's the SQL Server security model doing its job.
 
+
+/* -----------------------------------------------------------------------------
+   3b. Prove it: act as rag_app
+   -----------------------------------------------------------------------------
+   EXECUTE AS USER switches your session to rag_app, so every statement below
+   runs with only the grants above. REVERT puts you back as sa. If a batch
+   stops early, run REVERT by hand before you continue.
+----------------------------------------------------------------------------- */
+
+-- 1. Direct table access is denied (Msg 229):
+EXECUTE AS USER = 'rag_app';
+BEGIN TRY
+    SELECT TOP (1) * FROM dbo.Posts;
+END TRY
+BEGIN CATCH
+    PRINT CONCAT('Msg ', ERROR_NUMBER(), ': ', ERROR_MESSAGE());
+END CATCH;
+REVERT;
+GO
+
+-- 2. The vector column is off limits too:
+EXECUTE AS USER = 'rag_app';
+BEGIN TRY
+    SELECT TOP (1) embeddings FROM dbo.QuestionEmbeddings;
+END TRY
+BEGIN CATCH
+    PRINT CONCAT('Msg ', ERROR_NUMBER(), ': ', ERROR_MESSAGE());
+END CATCH;
+REVERT;
+GO
+
+-- 3. But the proc works. Ownership chaining lets it read the tables on the
+--    app's behalf. The path is ANN because the index is visible to rag_app:
+EXECUTE AS USER = 'rag_app';
+EXEC dbo.find_similar_questions @prompt = N'how do I undo my last git commit?', @top = 3;
+REVERT;
+GO
+
+-- 4. The proc source is hidden from the app:
+EXECUTE AS USER = 'rag_app';
+SELECT OBJECT_DEFINITION(OBJECT_ID('dbo.find_similar_questions')) AS proc_source;   -- NULL
+REVERT;
+GO
+
+-- 5. The VIEW DEFINITION gotcha, live. Take the grant away and the same proc
+--    quietly takes the slow path. No error, just search_path = 'kNN':
+REVOKE VIEW DEFINITION ON dbo.QuestionEmbeddings FROM rag_app;
+GO
+EXECUTE AS USER = 'rag_app';
+EXEC dbo.find_similar_questions @prompt = N'how do I undo my last git commit?', @top = 3;
+REVERT;
+GO
+
+-- Put it back:
+GRANT VIEW DEFINITION ON dbo.QuestionEmbeddings TO rag_app;
+GO
+EXECUTE AS USER = 'rag_app';
+EXEC dbo.find_similar_questions @prompt = N'how do I undo my last git commit?', @top = 3;
+REVERT;
+GO
+
 USE [master];
 GO
 
@@ -515,8 +580,8 @@ GO
    Managed Instance (Always-up-to-date) don't need it: their latest-version
    index supports DML and maintains itself in the background.
 
-   Heads up: step 3 rebuilds the index over ~10,000 rows, which can take a
-   couple of minutes.
+   Heads up: step 3 rebuilds the index over ~10,000 rows, which takes
+   about ten seconds on my M2.
 ----------------------------------------------------------------------------- */
 
 USE [StackOverflow];
@@ -593,6 +658,12 @@ GO
      5. Drop the old table and model
 
    The app never changes. Step 4 is the cutover, and it's one statement.
+
+   Build the new index AFTER the backfill, not before. The docs say the same
+   about any near-complete replacement of your embeddings: the index was
+   built for a different distribution, searches still return valid rows, but
+   recall and ranking can quietly degrade. Drop and recreate the index after
+   the new vectors are loaded, then re-measure recall (Demo 02 §3a).
 
    Prerequisite (run on the host, ~670 MB):
        ollama pull mxbai-embed-large
@@ -679,6 +750,68 @@ GO
 DROP TABLE IF EXISTS dbo.QuestionEmbeddings_mxbai;
 DROP EXTERNAL MODEL ollama_mxbai;
 GO
+*/
+
+
+/* -----------------------------------------------------------------------------
+   4c. Monitoring and staleness
+   -----------------------------------------------------------------------------
+   A vector pipeline fails quietly. Nothing errors when an embedding goes
+   stale, or when the index is missing and the proc falls back to a scan. So
+   you check for it. These are the queries I'd schedule. setup/init.sql
+   creates a dba_monitor login (VIEW SERVER STATE and VIEW DATABASE STATE) so
+   you can run them without sa:
+       sqlcmd -S localhost,1435 -U dba_monitor -P 'MonitorP@ss123!' -d StackOverflow
+
+   SQL Server 2025 CU10 doesn't have sys.dm_db_vector_indexes, the DMV that
+   reports index staleness on Azure SQL. So here the signals are catalog
+   views and your own comparisons.
+----------------------------------------------------------------------------- */
+
+-- 1. Is the index there? If this returns no rows, the app is on exact kNN.
+SELECT
+    OBJECT_NAME(v.object_id)  AS table_name,
+    v.name                    AS index_name,
+    v.vector_index_type,
+    v.distance_metric
+FROM sys.vector_indexes v;
+GO
+
+-- 2. Stale embeddings: the chunk we embedded no longer matches the source.
+--    This is the job the chunk column does (see §1b). Same expression that
+--    built the chunk, so any difference means the title or tags changed.
+SELECT TOP (20)
+    qe.PostId,
+    qe.chunk                                          AS embedded_text,
+    p.Title + N' ' +
+        REPLACE(REPLACE(REPLACE(ISNULL(p.Tags, N''), N'><', N' '), N'<', N''), N'>', N'')
+                                                      AS current_text
+FROM dbo.QuestionEmbeddings qe
+JOIN dbo.Posts p ON p.Id = qe.PostId
+WHERE qe.chunk <> p.Title + N' ' +
+        REPLACE(REPLACE(REPLACE(ISNULL(p.Tags, N''), N'><', N' '), N'<', N''), N'>', N'');
+GO
+
+-- 3. Coverage: embedded questions versus the backlog still to embed.
+SELECT
+    (SELECT COUNT(*) FROM dbo.QuestionEmbeddings)                                AS embedded,
+    (SELECT COUNT(*) FROM dbo.Posts WHERE PostTypeId = 1 AND Title IS NOT NULL)  AS embeddable,
+    (SELECT COUNT(*) FROM dbo.Posts WHERE PostTypeId = 1 AND Title IS NOT NULL)
+      - (SELECT COUNT(*) FROM dbo.QuestionEmbeddings)                            AS backlog;
+GO
+
+-- 4. Is search going through the index? The app reports search_path on every
+--    call. Log it, and alert when 'kNN' shows up outside a maintenance window.
+
+/*
+   WHAT I'D ADD NEXT, NOT BUILT HERE
+     - Hybrid search: combine this vector search with full-text search and
+       merge the two ranked lists (reciprocal rank fusion). Vector search is
+       great at meaning and weak at exact tokens like error codes and names.
+     - A hard filter pushed into the search (tenant, date, permissions). On
+       this build the filter runs after the graph walk. Demo 02 §4b is why
+       you oversample TOP_N.
+     - Alerts on the four checks above.
 */
 
 

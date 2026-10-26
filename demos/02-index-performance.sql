@@ -24,7 +24,7 @@ GO
 
         bash setup/expand-embeddings.sh
 
-    (~30 min on my M2 with Ollama on the host. The script shows batch progress.)
+    (~4 minutes on my M2 with Ollama on the host. The script shows batch progress.)
 
   Connect:
     Server:   localhost,1435
@@ -32,6 +32,9 @@ GO
     Password: S0methingS@Str0ng!   (demo only)
 
   Run the sections top to bottom. Every one is idempotent.
+
+  §2b needs the StackOverflowScale database (1,000,000 rows). Build it ahead
+  of time with: bash setup/build-scale-db.sh
 
   Optional deep dives live in demos/02-index-performance-optional.sql.
 
@@ -143,12 +146,12 @@ GO
    Let's drop and rebuild so you can see the real timing. Here's what I
    measured on this stack (SQL Server 2025 CU10, Apple Silicon M2):
      1,000 rows    ~11 seconds
-     10,000 rows   anywhere from ~23 seconds to ~2 minutes on a running
-                   instance, and ~340 seconds right after a restart
+     10,000 rows   10 to 12 seconds on a running instance (an earlier run
+                   saw ~340 seconds right after a restart)
    Build time swings a lot with what's cached and what else the box is
    doing. Measure it on your hardware before you size a maintenance window.
 
-   The build can take a couple of minutes. If you'd rather not wait, skip
+   The build takes about ten seconds here. If you'd rather not wait, skip
    the DROP/CREATE and just run 1c against the existing index.
 
    NOTE: SQL Server 2025 (earlier-version DiskANN) makes the table READ-ONLY
@@ -244,6 +247,61 @@ EXEC sp_spaceused 'dbo.QuestionEmbeddings';
 GO
 
 
+/* -----------------------------------------------------------------------------
+   1d. Which DiskANN version is this? The syntax in this demo is the old one
+   -----------------------------------------------------------------------------
+   Everything in these demos uses the EARLIER-VERSION index, because that's
+   what SQL Server 2025 on-premises builds. The docs are explicit about where
+   that's headed:
+
+     - Earlier-version indexes are supported today but "will be retired in a
+       future version." You can't upgrade one in place. You drop and recreate.
+     - The TOP_N parameter of VECTOR_SEARCH is deprecated and kept only for
+       earlier-version indexes.
+     - The latest version (GA on Azure SQL Database, SQL database in Fabric,
+       and Managed Instance with the Always-up-to-date policy) adds full DML,
+       iterative filtering, and an optimizer that picks ANN or kNN for you.
+
+   If you copy the queries from this repo to Azure SQL, they fail:
+
+       Msg 42274: Vector search with version 3 index does not support
+                  explicit TOP_N parameter.
+
+   Here's the same search in both syntaxes. Only the first one runs on this
+   server:
+
+       -- Earlier version (this server):
+       SELECT t.PostId, s.distance
+       FROM VECTOR_SEARCH(TABLE = dbo.QuestionEmbeddings AS t, COLUMN = [embeddings],
+                          SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 10) AS s
+       ORDER BY s.distance;
+
+       -- Latest version (Azure SQL DB, Fabric, MI Always-up-to-date):
+       SELECT TOP (10) WITH APPROXIMATE t.PostId, s.distance
+       FROM VECTOR_SEARCH(TABLE = dbo.QuestionEmbeddings AS t, COLUMN = [embeddings],
+                          SIMILAR_TO = @qv, METRIC = 'cosine') AS s
+       ORDER BY s.distance;
+
+   Docs:
+     https://learn.microsoft.com/en-us/sql/t-sql/statements/create-vector-index-transact-sql
+     https://learn.microsoft.com/en-us/sql/t-sql/functions/vector-search-transact-sql
+----------------------------------------------------------------------------- */
+
+-- Check your index version. No Version key (NULL) means earlier-version.
+-- Version = 3 means latest.
+SELECT
+    i.name                                          AS index_name,
+    JSON_VALUE(v.build_parameters, '$.Version')     AS index_version,
+    CASE
+        WHEN JSON_VALUE(v.build_parameters, '$.Version') >= '3'
+        THEN 'Latest version: no migration needed'
+        ELSE 'Earlier version: drop and recreate to migrate, and expect it to be retired'
+    END                                             AS migration_status
+FROM sys.vector_indexes v
+JOIN sys.indexes        i ON i.object_id = v.object_id AND i.index_id = v.index_id;
+GO
+
+
 /* =============================================================================
    SECTION 2. PERFORMANCE: ANN vs. kNN SIDE-BY-SIDE IO COMPARISON
    ============================================================================= */
@@ -312,10 +370,10 @@ GO
 -- WHAT TO LOOK FOR (measured on this stack, 10,000 rows, warm cache):
 --
 --                      kNN (scan)      ANN (graph walk)
---   QuestionEmbeddings  7,057 reads     2,265 reads
+--   QuestionEmbeddings  7,055 reads     2,301 reads
 --   Worktable               0             671 reads
 --   Graph edge table        -              50 reads
---   Total reads         7,057           2,986
+--   Total reads         7,055           3,022
 --   CPU time            37-63 ms        8-11 ms
 --   Elapsed time        13-28 ms        7-10 ms
 --
@@ -327,6 +385,95 @@ GO
 --
 -- And at 1,000 rows ANN LOSES: about 1,555 total reads vs 502 for the scan.
 -- Small tables don't need a vector index. Section 2a shows the crossover.
+--
+-- Microsoft's own guidance agrees. The vectors overview recommends exact
+-- search when you have fewer than about 50,000 vectors to compare, and says
+-- a table can hold many more as long as your predicates cut the candidates to
+-- 50,000 or fewer. Our 10,000 rows are under that line. So the lesson isn't
+-- "the index is always faster." It's "know where the line is for your data,"
+-- and Section 2b measures past it.
+--   https://learn.microsoft.com/en-us/sql/sql-server/ai/vectors
+
+
+/* -----------------------------------------------------------------------------
+   2-plan. Query execution: the Vector Index Seek operator
+   -----------------------------------------------------------------------------
+   VECTOR_SEARCH brings its own plan operator. It isn't a Clustered Index Scan
+   (full table read) or a B-tree Index Seek (point or range lookup). It's:
+
+       Vector Index Seek
+
+   Turn on the actual plan in SSMS (Ctrl+M) and run the query below. Here's
+   the ANN plan shape:
+
+       Top
+        └─ Nested Loops
+            ├─ Nested Loops
+            │   ├─ Vector Index Seek     ← DiskANN graph walk, returns TOP_N keys
+            │   └─ Clustered Index Seek  ← QuestionEmbeddings row lookup
+            └─ Clustered Index Seek      ← Posts row lookup
+
+   Compare that to the exact kNN plan from Demo 01 §4b (no vector index):
+
+       Top N Sort
+        └─ Compute Scalar            ← VECTOR_DISTANCE computed for every row
+            └─ Clustered Index Scan  ← full scan over every row
+
+   The graph walk replaces the Scan plus the Compute Scalar. That's the whole
+   difference, and it's why the reads in §2 drop.
+
+   If SSMS says "'Vector Index Seek' is not a valid value for PhysicalOpType",
+   your client's showplan schema predates the operator. Update SSMS, or use
+   the plan cache query below, which reads the XML on the server.
+----------------------------------------------------------------------------- */
+
+DECLARE @qv VECTOR(768) = AI_GENERATE_EMBEDDINGS(
+    N'how do I undo my last git commit?' USE MODEL ollama
+);
+SELECT TOP(5) /* demo-ann-plan */
+    t.PostId,
+    p.Title,
+    s.distance,
+    p.Score
+FROM VECTOR_SEARCH(
+    TABLE      = dbo.QuestionEmbeddings AS t,
+    COLUMN     = [embeddings],
+    SIMILAR_TO = @qv,
+    METRIC     = 'cosine',
+    TOP_N      = 5
+) AS s
+JOIN dbo.Posts p ON t.PostId = p.Id
+ORDER BY s.distance;
+GO
+
+-- No SSMS plan viewer? Read the operator tree from the plan cache:
+SELECT
+    r.value('@NodeId',                    'INT')           AS node_id,
+    r.value('@PhysicalOp',                'NVARCHAR(100)') AS physical_op,
+    ROUND(r.value('@EstimateRows',        'FLOAT'), 1)     AS est_rows,
+    ROUND(r.value('@EstimatedTotalSubtreeCost', 'FLOAT'), 4) AS subtree_cost
+FROM sys.dm_exec_cached_plans cp
+CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) st
+CROSS APPLY sys.dm_exec_query_plan(cp.plan_handle) qp
+CROSS APPLY qp.query_plan.nodes(
+    'declare namespace x="http://schemas.microsoft.com/sqlserver/2004/07/showplan";
+     //x:RelOp') AS n(r)
+WHERE st.text LIKE N'%demo-ann-plan%'                 -- the marker in the query above
+  AND st.text NOT LIKE N'%dm_exec_cached_plans%'      -- not this query
+ORDER BY node_id;
+GO
+-- EXPECTED OUTPUT (node ids can differ on your build):
+--   physical_op           est_rows  subtree_cost
+--   Top                        1.0        0.1355
+--   Nested Loops               1.0        0.1355
+--   Nested Loops               1.0        0.1322
+--   Vector Index Seek          1.0        0.1289   ← DiskANN
+--   Clustered Index Seek       1.0        0.0033   ← QuestionEmbeddings lookup
+--   Clustered Index Seek       1.0        0.0033   ← Posts lookup
+--
+-- Notice est_rows = 1.0 on the Vector Index Seek even though it returns 5.
+-- The optimizer doesn't estimate vector search cardinality well yet, so don't
+-- trust row estimates downstream of it.
 
 
 /* -----------------------------------------------------------------------------
@@ -413,6 +560,254 @@ GO
 --   - ANN at 10,000 rows costs about what kNN costs at 1,000.
 --   - Below a few thousand rows, a vector index isn't worth it (see the
 --     1,000-row note at the end of the IO comparison above).
+
+
+/* -----------------------------------------------------------------------------
+   2b. Scale past the corpus: 1,000,000 vectors in StackOverflowScale
+   -----------------------------------------------------------------------------
+   10,000 rows is under Microsoft's ~50,000-vector guidance for exact search.
+   To see what happens past that line, switch to StackOverflowScale, a second
+   database with 1,000,000 vectors and its own vector index. It lives apart
+   from StackOverflow so Demo 03's drop-and-rebuild never touches it.
+
+   Build it once, ahead of time (about 80 minutes; it's resumable):
+       bash setup/build-scale-db.sh
+   or restore the backup it wrote:
+       bash setup/build-scale-db.sh --restore
+
+   WHAT THE DATA IS, AND ISN'T
+     - The 1,000,000 rows are the 10,000 real embeddings from StackOverflow,
+       each with 100 noisy copies. They keep real topic structure, so
+       neighbors cluster the way text does and recall means something.
+     - They're SYNTHETIC. The titles aren't real questions. Use this for
+       timing, reads, and recall. Not for search quality.
+     - The copies of one center are close to each other, which is easier for
+       the index than a corpus of 1,000,000 distinct documents. Treat recall
+       here as an upper bound.
+----------------------------------------------------------------------------- */
+
+USE [StackOverflowScale];
+GO
+
+-- What we're working with: row count, size, and the index.
+SELECT COUNT(*) AS rows_in_table FROM dbo.ScaleVectors;
+EXEC sp_spaceused 'dbo.ScaleVectors';
+GO
+
+SELECT
+    v.name                                          AS index_name,
+    v.vector_index_type,
+    v.distance_metric,
+    JSON_VALUE(v.build_parameters, '$.R')           AS max_degree_R,
+    JSON_VALUE(v.build_parameters, '$.L')           AS build_list_L
+FROM sys.vector_indexes v;
+GO
+
+-- The graph, compared to the table. It stays a small fraction of the vectors.
+SELECT
+    it.name                     AS internal_table,
+    SUM(au.total_pages) * 8 / 1024 AS size_MB
+FROM sys.internal_tables  it
+JOIN sys.partitions       p  ON p.object_id = it.object_id
+JOIN sys.allocation_units au ON au.container_id = p.hobt_id
+WHERE it.parent_object_id = OBJECT_ID('dbo.ScaleVectors')
+GROUP BY it.name;
+GO
+
+-- One query, both ways, with the reads. Compare to the 10,000-row numbers in §2.
+SET STATISTICS IO ON;
+SET STATISTICS TIME ON;
+GO
+DECLARE @qv VECTOR(768) = (SELECT v FROM dbo.ScaleVectors WHERE Id = 7);
+
+PRINT '--- EXACT kNN over 1,000,000 rows ---';
+SELECT TOP (10) s.Id, VECTOR_DISTANCE('cosine', @qv, s.v) AS distance
+FROM dbo.ScaleVectors s
+ORDER BY distance;
+
+PRINT '--- ANN over 1,000,000 rows ---';
+SELECT t.Id, s.distance
+FROM VECTOR_SEARCH(TABLE = dbo.ScaleVectors AS t, COLUMN = [v],
+                   SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 10) AS s
+ORDER BY s.distance;
+GO
+SET STATISTICS IO OFF;
+SET STATISTICS TIME OFF;
+GO
+
+-- The same harness as §2a: exact kNN over slices of the table, ANN over all of it.
+SET NOCOUNT ON;
+DECLARE @qv VECTOR(768) = (SELECT v FROM dbo.ScaleVectors WHERE Id = 7);
+DECLARE @results TABLE (search_path VARCHAR(4), rows_searched INT, avg_elapsed_ms DECIMAL(9,1), avg_cpu_ms DECIMAL(9,1));
+DECLARE @n INT, @i INT, @t DATETIME2, @us BIGINT, @cpu0 INT, @cpu_now INT, @sink INT;
+DECLARE @runs INT = 5;
+
+DECLARE @sizes TABLE (n INT PRIMARY KEY);
+INSERT INTO @sizes VALUES (10000), (50000), (100000), (250000), (500000), (1000000);
+
+SELECT @n = MIN(n) FROM @sizes;
+WHILE @n IS NOT NULL
+BEGIN
+    SELECT @i = 0, @us = 0;
+    SELECT @cpu0 = cpu_time FROM sys.dm_exec_requests WHERE session_id = @@SPID;
+    WHILE @i < @runs
+    BEGIN
+        SET @t = SYSDATETIME();
+        SELECT TOP (10) @sink = s.Id
+        FROM dbo.ScaleVectors s
+        WHERE s.Id <= @n
+        ORDER BY VECTOR_DISTANCE('cosine', @qv, s.v)
+        OPTION (RECOMPILE);
+        SET @us += DATEDIFF(MICROSECOND, @t, SYSDATETIME());
+        SET @i += 1;
+    END;
+    SELECT @cpu_now = cpu_time FROM sys.dm_exec_requests WHERE session_id = @@SPID;
+    INSERT INTO @results VALUES ('kNN', @n, @us / 1000.0 / @runs, (@cpu_now - @cpu0) * 1.0 / @runs);
+    SELECT @n = MIN(n) FROM @sizes WHERE n > @n;
+END;
+
+SELECT @i = 0, @us = 0;
+SELECT @cpu0 = cpu_time FROM sys.dm_exec_requests WHERE session_id = @@SPID;
+WHILE @i < @runs
+BEGIN
+    SET @t = SYSDATETIME();
+    SELECT @sink = t.Id
+    FROM VECTOR_SEARCH(TABLE = dbo.ScaleVectors AS t, COLUMN = [v],
+                       SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 10) AS s;
+    SET @us += DATEDIFF(MICROSECOND, @t, SYSDATETIME());
+    SET @i += 1;
+END;
+SELECT @cpu_now = cpu_time FROM sys.dm_exec_requests WHERE session_id = @@SPID;
+INSERT INTO @results
+SELECT 'ANN', COUNT(*), @us / 1000.0 / @runs, (@cpu_now - @cpu0) * 1.0 / @runs
+FROM dbo.ScaleVectors;
+
+SELECT search_path, rows_searched, avg_elapsed_ms, avg_cpu_ms
+FROM @results
+ORDER BY search_path DESC, rows_searched;
+GO
+
+/* -----------------------------------------------------------------------------
+   Recall at 1,000,000 rows, and what oversampling buys you
+   -----------------------------------------------------------------------------
+   The queries are real StackOverflow questions that are NOT among the 10,000
+   centers, so none of them has a noisy copy in the table. Their true nearest
+   neighbors are spread across many clusters, which is a much harder test than
+   querying with a vector that's already in the table. (My first version used
+   stored vectors as queries. Every neighbor was a copy from the same cluster,
+   and recall came out at a perfect 1.0. That proved nothing.)
+
+   We ask for the true top 10 and compare three ways to get it from the index:
+     TOP_N = 10    ask the graph for exactly 10
+     TOP_N = 50    ask for 50, keep the 10 closest
+     TOP_N = 200   ask for 200, keep the 10 closest
+   Asking for more candidates and trimming is the same oversampling trick as
+   Demo 02 §4b, now used to buy back recall instead of to beat a filter.
+
+   Two columns to read:
+     avg_recall_at_10   how many of the exact top 10 the index found
+     zero_queries       queries where the index found NONE of them
+     avg_best_gap       how much farther the index's best hit is than the true
+                        best hit. A small gap means the misses were near-misses.
+
+   Exact kNN over a million rows costs real time. This takes a few minutes.
+----------------------------------------------------------------------------- */
+
+SET NOCOUNT ON;
+DROP TABLE IF EXISTS #sq;
+DROP TABLE IF EXISTS #srecall;
+CREATE TABLE #sq      (qid INT IDENTITY PRIMARY KEY, qv VECTOR(768) NOT NULL);
+CREATE TABLE #srecall (top_n INT, qid INT, matched INT, exact_best FLOAT, ann_best FLOAT);
+
+INSERT INTO #sq (qv)
+SELECT TOP (50) qe.embeddings
+FROM StackOverflow.dbo.QuestionEmbeddings qe
+WHERE NOT EXISTS (SELECT 1 FROM dbo.Centers c WHERE c.PostId = qe.PostId)
+ORDER BY NEWID();
+
+DECLARE @k INT = 10;
+DECLARE @tn TABLE (n INT PRIMARY KEY);
+INSERT INTO @tn VALUES (10), (50), (200);
+
+DECLARE @n INT = (SELECT MIN(n) FROM @tn);
+WHILE @n IS NOT NULL
+BEGIN
+    DECLARE @qid INT = 1, @maxq INT = (SELECT MAX(qid) FROM #sq);
+    WHILE @qid <= @maxq
+    BEGIN
+        DECLARE @qv VECTOR(768) = (SELECT qv FROM #sq WHERE qid = @qid);
+
+        WITH knn AS (
+            SELECT TOP (@k) s.Id, VECTOR_DISTANCE('cosine', @qv, s.v) AS d
+            FROM dbo.ScaleVectors AS s
+            ORDER BY d
+        ),
+        ann AS (
+            SELECT TOP (@k) Id, d
+            FROM (
+                SELECT t.Id, s.distance AS d
+                FROM VECTOR_SEARCH(TABLE = dbo.ScaleVectors AS t, COLUMN = [v],
+                                   SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = @n) AS s
+            ) AS x
+            ORDER BY d
+        )
+        INSERT INTO #srecall (top_n, qid, matched, exact_best, ann_best)
+        SELECT @n, @qid,
+               (SELECT COUNT(*) FROM ann JOIN knn ON knn.Id = ann.Id),
+               (SELECT MIN(d) FROM knn),
+               (SELECT MIN(d) FROM ann);
+
+        SET @qid += 1;
+    END;
+    SET @n = (SELECT MIN(n) FROM @tn WHERE n > @n);
+END;
+
+SELECT
+    top_n,
+    COUNT(*)                                          AS queries,
+    CAST(AVG(matched * 1.0 / @k) AS DECIMAL(5,3))     AS avg_recall_at_10,
+    SUM(CASE WHEN matched = 0 THEN 1 ELSE 0 END)      AS zero_queries,
+    CAST(AVG(ann_best - exact_best) AS DECIMAL(6,4))  AS avg_best_gap
+FROM #srecall
+GROUP BY top_n
+ORDER BY top_n;
+
+DROP TABLE #sq;
+DROP TABLE #srecall;
+GO
+
+-- MEASURED (SQL Server 2025 CU10 17.0.5035.5, Docker on Apple Silicon,
+-- 1,000,000 synthetic rows, earlier-version DiskANN, R = 48, L = 48):
+--
+--   build:      generate 3,024 s (50 min) + index 1,591 s (26.5 min), backup 3.1 GB
+--   one query:  exact kNN 511,159 reads, 998 ms CPU, 134 ms elapsed
+--               ANN         3,637 reads (2,948 + 617 worktable + 72 graph), 8 ms CPU
+--   path  rows        elapsed ms   CPU ms
+--   kNN      100,000     33         97
+--   kNN      250,000    110        243
+--   kNN      500,000    142        494
+--   kNN    1,000,000    293      1,115
+--   ANN    1,000,000      2.7        2.8
+--
+--   recall@10, 50 random real questions that are not in the table (4 runs):
+--   TOP_N =  10    0.64 to 0.86     1 to 10 of 50 queries found none of the true top 10
+--   TOP_N =  50    0.95
+--   TOP_N = 200    0.998
+--   The best hit was only 0.003 to 0.014 farther than the true best at TOP_N = 10.
+--   The sample is random, so TOP_N = 10 swings a lot from run to run. Run it
+--   a couple of times before the talk and quote a range, not one number.
+--   At 10,000 real rows recall was 0.99 (§3a), so recall FELL as the table grew
+--   with the same index parameters. This data is synthetic and clustered, so
+--   don't promise your own number. Measure it, and oversample TOP_N.
+--
+-- WHAT TO SAY:
+--   Say what you measured and what you didn't. This is one session on an idle
+--   box. It isn't concurrent load, it isn't a corpus of distinct documents, and
+--   the index build time and memory are in the build log, not on stage.
+
+-- Back to the main database for the rest of the demos:
+USE [StackOverflow];
+GO
 
 
 /* =============================================================================
@@ -504,10 +899,130 @@ GO
 -- WHAT THE RECALL NUMBER TELLS YOU:
 --   recall_at_k = 1.0  → ANN returned identical results to exhaustive search.
 --   recall_at_k = 0.9  → 9 of 10 results match; 1 true neighbor was missed.
---   For a RAG workload to suffer, the missed neighbor would have to be the #1
---   most relevant chunk AND the other 9 would have to be irrelevant. That's a
---   pathological case.
---   In practice, high recall (> 0.95) means your retrieval quality is intact.
+-- One query is an anecdote. A single 10-result query on 10,000 rows will
+-- often read 1.0 and prove very little. Let's measure it properly.
+
+
+/* -----------------------------------------------------------------------------
+   3a. Recall averaged over 100 queries, at two values of K
+   -----------------------------------------------------------------------------
+   We sample 100 stored questions and use their own embeddings as the queries.
+   That means no Ollama calls, so this takes seconds and times SQL Server only.
+
+   A stored vector's nearest neighbor is itself (distance 0), and both
+   searches would find it. That inflates recall. So we ask each search for
+   K + 1 results, drop the query's own row, and keep the top K.
+
+   Compare K = 10 against K = 100. Watch the worst-query column: the average
+   hides the queries that did worse. The number you get here is
+   for THIS data, THIS model, and THIS index build. Rerun it on yours.
+----------------------------------------------------------------------------- */
+
+SET NOCOUNT ON;
+
+DROP TABLE IF EXISTS #queries;
+DROP TABLE IF EXISTS #recall;
+CREATE TABLE #queries (qid INT IDENTITY PRIMARY KEY, PostId INT NOT NULL);
+CREATE TABLE #recall  (k INT, qid INT, matched INT);
+
+INSERT INTO #queries (PostId)
+SELECT TOP (100) PostId FROM dbo.QuestionEmbeddings ORDER BY NEWID();
+
+DECLARE @ks TABLE (k INT PRIMARY KEY);
+INSERT INTO @ks VALUES (10), (100);
+
+DECLARE @k INT = (SELECT MIN(k) FROM @ks), @kp1 INT;
+WHILE @k IS NOT NULL
+BEGIN
+    SET @kp1 = @k + 1;   -- TOP_N takes a variable, so compute K + 1 up front
+    DECLARE @qid INT = 1, @maxq INT = (SELECT MAX(qid) FROM #queries);
+    WHILE @qid <= @maxq
+    BEGIN
+        DECLARE @post INT = (SELECT PostId FROM #queries WHERE qid = @qid);
+        DECLARE @qv VECTOR(768) = (SELECT embeddings FROM dbo.QuestionEmbeddings WHERE PostId = @post);
+
+        WITH knn AS (
+            SELECT TOP (@k) PostId
+            FROM (
+                SELECT TOP (@kp1) qe.PostId,
+                       VECTOR_DISTANCE('cosine', @qv, qe.embeddings) AS d
+                FROM dbo.QuestionEmbeddings qe
+                ORDER BY d
+            ) x
+            WHERE PostId <> @post
+            ORDER BY d
+        ),
+        ann AS (
+            SELECT TOP (@k) PostId
+            FROM (
+                SELECT t.PostId, s.distance AS d
+                FROM VECTOR_SEARCH(TABLE = dbo.QuestionEmbeddings AS t, COLUMN = [embeddings],
+                                   SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = @kp1) AS s
+            ) y
+            WHERE PostId <> @post
+            ORDER BY d
+        )
+        INSERT INTO #recall (k, qid, matched)
+        SELECT @k, @qid, COUNT(*) FROM ann JOIN knn ON knn.PostId = ann.PostId;
+
+        SET @qid += 1;
+    END;
+    SET @k = (SELECT MIN(k) FROM @ks WHERE k > @k);
+END;
+
+SELECT
+    k,
+    COUNT(*)                                          AS queries,
+    CAST(AVG(matched * 1.0 / k) AS DECIMAL(5,4))      AS avg_recall_at_k,
+    CAST(MIN(matched * 1.0 / k) AS DECIMAL(5,4))      AS worst_query_recall
+FROM #recall
+GROUP BY k
+ORDER BY k;
+
+DROP TABLE #queries;
+DROP TABLE #recall;
+GO
+
+-- HOW TO READ IT:
+--   avg_recall_at_k    the headline number. Above ~0.95 retrieval quality is
+--                      intact for most RAG workloads.
+--   worst_query_recall the tail. Averages hide the queries that got worse
+--                      context. Always look at the worst case too.
+--   Recall is a property of your data and the index build, not a constant.
+--   Measure it after every model change and every index rebuild.
+
+
+/* -----------------------------------------------------------------------------
+   3b. What "at scale" means, and what we haven't shown
+   -----------------------------------------------------------------------------
+   Everything in this script ran on 10,000 rows. That's a teaching corpus,
+   not scale. Here's what carries over and what doesn't:
+
+     MEASURED HERE (10,000 rows)
+       - Exact kNN reads and CPU grow linearly with row count (§2a).
+       - ANN cost grows far more slowly. At 10,000 rows it costs about what
+         kNN cost at 1,000.
+       - Below a few thousand rows the index loses (§2).
+       - Build time and the read-only table rule (§1b, §4a).
+
+     NOT MEASURED HERE
+       - Millions of rows. Extrapolating kNN's linear growth, a full scan
+         at 10 million rows is 1,000× the 10,000-row cost. That's the reason
+         the index exists, but it's an extrapolation, not a benchmark.
+       - Whether recall holds as the graph grows. Measure it on your data.
+       - Index build time and memory at that size. Optional Appendix C looks
+         at build resource cost.
+       - Concurrent load. Everything above is one session on an idle box.
+
+   For context only: the DiskANN paper reports over 5,000 queries per second
+   at under 3 ms latency with 95%+ recall on 1 billion SIFT vectors, on one
+   64 GB machine with an SSD. That's the authors' hardware, data, and
+   parameters. Treat it as proof the design scales, not as a promise for
+   SQL Server 2025.
+
+   Before you commit: load a realistic copy of your data, embed it with your
+   model, and run §2a and §3a against it. That's the only evidence that counts.
+----------------------------------------------------------------------------- */
 
 
 /* =============================================================================
@@ -676,10 +1191,21 @@ GO
      - You can't partition a vector index.
      - TRUNCATE TABLE fails while the index exists (Msg 42232).
      - Vector indexes aren't replicated to subscribers.
+     - The docs say the latest-version index needs at least 100 rows with
+       non-NULL vectors (Msg 42266). The earlier-version index on this build
+       doesn't enforce it: it builds on 50 rows, and even on an empty table.
+       Expect the error when you move to Azure SQL.
+     - VECTOR_SEARCH can't be used in the body of a view.
+     - DacPac can't deploy a vector index. BACPAC can, with DacFx 170.5.96 or
+       later, and the table needs 100 rows loaded first. Check
+       sys.vector_indexes after any deployment.
+     - A VECTOR column can't be a key, can't carry DEFAULT or CHECK
+       constraints, and isn't supported in memory-optimized tables or with
+       Always Encrypted.
      - VECTOR_SEARCH with no index on the column fails with Msg 42227 on
        this build. Demo 03 shows how the app's proc handles that.
 
-   Let's see the first two fail:
+   Let's see the first two fail, then the 100-row rule:
 ----------------------------------------------------------------------------- */
 
 DROP TABLE IF EXISTS dbo.vt_guid_key;
@@ -710,4 +1236,20 @@ BEGIN CATCH
     PRINT CONCAT('Msg ', ERROR_NUMBER(), ': ', ERROR_MESSAGE());
 END CATCH;
 DROP TABLE #vt_temp;
+GO
+
+-- And the 100-row minimum. It's documented for the latest-version index only.
+-- Here, on the earlier-version index, 50 rows builds with no error. On Azure SQL
+-- (latest version) the same statement fails with Msg 42266:
+CREATE TABLE dbo.vt_small (id INT NOT NULL PRIMARY KEY CLUSTERED, v VECTOR(768) NOT NULL);
+INSERT INTO dbo.vt_small SELECT TOP (50) PostId, embeddings FROM dbo.QuestionEmbeddings;
+
+BEGIN TRY
+    CREATE VECTOR INDEX vi ON dbo.vt_small(v) WITH (METRIC = 'cosine', TYPE = 'diskann');
+    PRINT 'Built on 50 rows: no Msg 42266 on the earlier-version index.';
+END TRY
+BEGIN CATCH
+    PRINT CONCAT('Msg ', ERROR_NUMBER(), ': ', ERROR_MESSAGE());
+END CATCH;
+DROP TABLE dbo.vt_small;
 GO
