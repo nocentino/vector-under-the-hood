@@ -235,12 +235,6 @@ SELECT
      WHERE it.parent_object_id = OBJECT_ID('dbo.QuestionEmbeddings')) AS graph_MB;
 GO
 
-/* -----------------------------------------------------------------------------
-    APPENDIX D. Execution plan anatomy: the Vector Index Seek operator
-   -----------------------------------------------------------------------------
-   Moved into the core script: see demos/02-index-performance.sql, §2-plan.
------------------------------------------------------------------------------ */
-
 /* =============================================================================
     APPENDIX E. LATEST-VERSION DiskANN: WHAT'S NEW (Azure SQL DB / Fabric)
    =============================================================================

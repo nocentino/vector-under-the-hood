@@ -236,28 +236,7 @@ GO
 
 
 /* =============================================================================
-   STEP 7a: Application views
-   ============================================================================= */
-
--- A tidy, agent-friendly view over Questions with just the useful columns.
--- Tags get cleaned up from <tag1><tag2> XML form to "tag1, tag2" text.
-CREATE OR ALTER VIEW dbo.vQuestions AS
-SELECT
-    p.Id,
-    p.Title,
-    REPLACE(REPLACE(REPLACE(ISNULL(p.Tags, N''), '><', ', '), '<', ''), '>', '') AS Tags,
-    p.Score,
-    p.ViewCount,
-    p.AnswerCount,
-    p.CreationDate,
-    p.OwnerUserId
-FROM dbo.Posts p
-WHERE p.PostTypeId = 1;
-GO
-
-
-/* =============================================================================
-   STEP 7b: Semantic search stored procedure
+   STEP 7a: Semantic search stored procedure
    ============================================================================= */
 
 -- The main retrieval procedure for rag-app.py and Demo 03.
@@ -339,7 +318,7 @@ GO
 
 
 /* =============================================================================
-   STEP 7c: Top-answer retrieval stored procedure
+   STEP 7b: Top-answer retrieval stored procedure
    ============================================================================= */
 
 -- Returns the accepted answer (if there is one) or the highest-scored answer
