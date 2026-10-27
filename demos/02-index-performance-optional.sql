@@ -340,7 +340,15 @@ GO
 
    WITH APPROXIMATE tells the optimizer approximate results are OK. It then
    decides whether to use the DiskANN index or fall back to exact kNN based
-   on data size, predicates, and cost.
+   on data size, predicates, and cost. Leave WITH APPROXIMATE off and the same
+   TOP (N) ... ORDER BY distance runs as exact kNN.
+
+   The docs' rules for WITH APPROXIMATE:
+     - It needs VECTOR_SEARCH in the query and an ORDER BY (Msg 42248).
+     - ORDER BY must be the distance column only, ascending (Msg 42271).
+       Sort by anything else in an outer query.
+     - FORCE_ANN_ONLY as a table hint on VECTOR_SEARCH forces the index and
+       skips the optimizer's choice.
 
    MIGRATION WARNING: if you create a latest-version index and keep the
    old TOP_N syntax, the query fails with Msg 42274. Update the query
@@ -398,10 +406,11 @@ ORDER BY s.distance;
      Selective filters can eliminate ALL candidates → zero results.
      Workaround: oversample (increase TOP_N).
 
-   Latest-version: the optimizer pushes predicates INTO the graph walk.
-     The walk only considers nodes that satisfy the filter.
-     You get exactly the K results you asked for, even with tight filters.
-     No oversampling needed. No TOP_N hint needed.
+   Latest-version: predicates apply DURING the graph walk (iterative
+     filtering). The docs say the engine keeps searching until it finds
+     enough qualifying rows or runs out of graph, so you get the K results
+     you asked for when they exist, even with tight filters.
+     No oversampling needed. No TOP_N parameter.
 
    Syntax comparison:
 
@@ -468,11 +477,15 @@ GO
          It rises during write bursts and drains back toward 0.
 
      quantized_keys_used_percent
-         How much of the index is using quantized keys.
+         Percentage of the quantized key space the index uses.
 
      last_background_task_succeeded
          1 when the last maintenance run finished without errors. If it
          stays 0, read last_background_task_error_message.
+
+   It needs VIEW DATABASE STATE. The docs say not to rebuild just because
+   graph_catchup_pending_percent is briefly above zero; rebuild when recall
+   or latency degrades, or after replacing most of the embeddings.
 
    This CU10 build doesn't have the DMV yet, so the query checks first.
 ----------------------------------------------------------------------------- */

@@ -89,7 +89,13 @@ GO
      3. Persists the graph to internal tables (Section 1c shows them)
 
    MAXDOP: the CREATE VECTOR INDEX syntax accepts it, but SQL Server 2025
-   ignores it. That's a documented known issue, so I leave it off.
+   ignores it, for the build and for VECTOR_SEARCH. That's a documented known
+   issue, so I leave it off. The docs' workaround is the server-level max
+   degree of parallelism or a database scoped MAXDOP.
+
+   You'll also see "Warning: The join order has been enforced because a local
+   join hint is used." That's on the same known-issues list, and the docs say
+   it's safe to ignore.
      https://learn.microsoft.com/en-us/sql/sql-server/sql-server-2025-known-issues
 
    Let's drop and rebuild so you can see the real timing. Here's what I
@@ -568,8 +574,10 @@ GO
    list the read-only rule but not the error numbers. These are what this
    build returns.
 
-   ALLOW_STALE_VECTOR_INDEX isn't an option here. The docs say it "isn't
-   currently available in SQL Server 2025", and it fails with Msg 102.
+   ALLOW_STALE_VECTOR_INDEX isn't an option here. The CREATE VECTOR INDEX page
+   suggests it for earlier-version indexes, but the ALTER DATABASE SCOPED
+   CONFIGURATION page says it "isn't currently available in SQL Server 2025"
+   (it's Azure SQL Database and Fabric only), and on CU10 it fails with Msg 102.
 
    That's a big operational problem if your workload keeps adding new
    embeddings as new content arrives.
@@ -717,10 +725,10 @@ GO
      - You can't partition a vector index.
      - TRUNCATE TABLE fails while the index exists (Msg 42232).
      - Vector indexes aren't replicated to subscribers.
-     - The docs say the latest-version index needs at least 100 rows with
-       non-NULL vectors (Msg 42266). The earlier-version index on this build
-       doesn't enforce it: it builds on 50 rows, and even on an empty table.
-       Expect the error when you move to Azure SQL.
+     - The docs list a minimum of 100 rows with non-NULL vectors (Msg 42266),
+       and their examples tie it to the latest-version index. The
+       earlier-version index on this build doesn't enforce it: it builds on
+       50 rows, and even on an empty table. Expect the error on Azure SQL.
      - VECTOR_SEARCH can't be used in the body of a view.
      - DacPac can't deploy a vector index. BACPAC can, with DacFx 170.5.96 or
        later, and the table needs 100 rows loaded first. Check
@@ -764,7 +772,7 @@ END CATCH;
 DROP TABLE #vt_temp;
 GO
 
--- And the 100-row minimum. It's documented for the latest-version index only.
+-- And the 100-row minimum. The docs' examples tie it to the latest-version index.
 -- Here, on the earlier-version index, 50 rows builds with no error. On Azure SQL
 -- (latest version) the same statement fails with Msg 42266:
 CREATE TABLE dbo.vt_small (id INT NOT NULL PRIMARY KEY CLUSTERED, v VECTOR(768) NOT NULL);

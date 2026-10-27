@@ -601,8 +601,9 @@ GO
    -----------------------------------------------------------------------------
    On SQL Server 2025 a table with a vector index is read-only. INSERT,
    UPDATE, DELETE, and MERGE fail with Msg 42231, and TRUNCATE TABLE fails
-   with Msg 42232. ALLOW_STALE_VECTOR_INDEX doesn't help here: the docs say
-   it isn't available in SQL Server 2025 (it's Azure SQL Database and Fabric).
+   with Msg 42232. ALLOW_STALE_VECTOR_INDEX doesn't help here: the ALTER
+   DATABASE SCOPED CONFIGURATION docs say it isn't available in SQL Server 2025
+   (it's Azure SQL Database and Fabric), and CU10 rejects it with Msg 102.
 
    So you load new content with a cycle:
 

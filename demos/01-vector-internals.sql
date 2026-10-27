@@ -346,7 +346,10 @@ GO
        around 0.00001, and the optional Appendix A measures it.
 
    PLATFORM NOTE: float16 is a PREVIEW feature in SQL Server 2025, so it needs
-   PREVIEW_FEATURES on (already on, from the DiskANN setup in init.sql).
+   PREVIEW_FEATURES on (already on, from the DiskANN setup in init.sql). The
+   docs also say float16 isn't supported on Arm64. It works on this Apple
+   Silicon laptop because the container runs as linux/amd64 under Rosetta.
+     https://learn.microsoft.com/en-us/sql/t-sql/data-types/vector-data-type-half-precision-float
 ----------------------------------------------------------------------------- */
 
 -- Same 768 values, two storage types. The header is the same size in both:
@@ -666,8 +669,8 @@ SET STATISTICS IO OFF;
 SET STATISTICS TIME OFF;
 GO
 -- Look at "read-ahead reads" on QuestionEmbeddings. On my box it was about
--- 6,900 pages, and the query ran 5 to 10 times slower than warm (125 to 210 ms
--- against 12 to 25 ms). The scan is sequential, so the engine reads ahead in
+-- 7,000 pages, and the query ran 3 to 10 times slower than warm (40 to 210 ms
+-- against 8 to 25 ms). The scan is sequential, so the engine reads ahead in
 -- big chunks. That's the I/O profile from Section 0, and it's why the
 -- EMBEDDINGS filegroup's storage matters for exact search and for index builds.
 
@@ -713,3 +716,34 @@ GO
    graph walk. Demo 2 measures when that pays off and when it doesn't.
 ----------------------------------------------------------------------------- */
 
+
+
+/* -----------------------------------------------------------------------------
+   4c. Why a B-tree can't help
+   -----------------------------------------------------------------------------
+   Every index you already know is a B-tree, and a B-tree needs a key it can
+   compare and sort. A vector has neither. The docs say it plainly: no B-tree
+   or columnstore index on a vector column, and no comparison operators.
+     https://learn.microsoft.com/en-us/sql/t-sql/data-types/vector-data-type#limitations
+
+   Three tries, three errors. These are expected.
+----------------------------------------------------------------------------- */
+
+-- 1. A vector can't be an index key (Msg 1978):
+CREATE INDEX ix_vec_key ON dbo.QuestionEmbeddings(embeddings);
+GO
+
+-- 2. Or compared with = (Msg 8117):
+DECLARE @qv VECTOR(768) = (SELECT embeddings FROM dbo.QuestionEmbeddings WHERE PostId = 219716);
+SELECT COUNT(*) FROM dbo.QuestionEmbeddings WHERE embeddings = @qv;
+GO
+
+-- 3. Or sorted (Msg 42213):
+SELECT TOP (1) PostId FROM dbo.QuestionEmbeddings ORDER BY embeddings;
+GO
+
+-- You CAN carry a vector as an INCLUDE column on a normal index, but that
+-- only copies it. It doesn't help find neighbors.
+--
+-- "Close to" isn't something a sort order can answer. That's why exact kNN
+-- reads every row, and why the vector index in Demo 2 is a graph, not a tree.
