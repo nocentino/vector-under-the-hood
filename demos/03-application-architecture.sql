@@ -203,6 +203,26 @@ ORDER BY AnswerId, chunk_order;
 GO
 -- In production, strip the HTML before chunking. The model embeds the tags too.
 
+-- Now use them. Search the passages, not the questions: which piece of which
+-- answer best matches a question? There are only a few dozen chunks, so an
+-- exact search is the right tool here (no vector index needed).
+DECLARE @qv VECTOR(768) = AI_GENERATE_EMBEDDINGS(
+    N'how do I undo a commit but keep my changes?' USE MODEL ollama);
+
+SELECT TOP (3)
+    c.AnswerId,
+    c.chunk_order,
+    VECTOR_DISTANCE('cosine', @qv, c.embeddings) AS distance,
+    LEFT(c.chunk, 200)                           AS passage
+FROM dbo.AnswerChunks c
+ORDER BY distance;
+GO
+-- The winner is a passage from the git answer, not the whole answer. That's
+-- the point of chunking: the context you hand the LLM is the paragraph that
+-- answers the question, not 3,000 characters around it. The app in this repo
+-- still sends question titles plus a trimmed answer. Searching chunks is the
+-- next step up.
+
 
 /* =============================================================================
    SECTION 2: THE RAG STORED PROCEDURES
@@ -249,6 +269,12 @@ GO
    ANN raises Msg 50002 if the index is missing. KNN always forces the exact
    scan, which is handy when you're comparing recall or performance.
 
+   The ANN path applies Demo 02's lesson: it asks the graph for
+   @top × @oversample candidates (5x by default) and keeps the closest @top.
+   At 10,000 rows you won't see a difference. At 1,000,000 rows it's the
+   difference between finding about 80% and about 97% of the true top 10, for
+   roughly 20 ms more per search (Demo 02 §3b).
+
    The docs say VECTOR_SEARCH with no matching index raises a warning and
    falls back to kNN. On SQL Server 2025 CU10 it raises Msg 42227 instead, so
    the proc has to make the choice itself.
@@ -267,7 +293,8 @@ GO
 CREATE OR ALTER PROCEDURE dbo.find_similar_questions
     @prompt NVARCHAR(MAX),
     @top    INT = 5,
-    @search_mode VARCHAR(10) = 'AUTO'
+    @search_mode VARCHAR(10) = 'AUTO',
+    @oversample  INT = 5
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -285,12 +312,20 @@ BEGIN
     IF @mode = 'ANN' AND @has_index = 0
         THROW 50002, 'ANN search requires a vector index on dbo.QuestionEmbeddings.', 1;
 
+    IF @oversample IS NULL OR @oversample < 1
+        THROW 50003, '@oversample must be 1 or more.', 1;
+
+    -- Ask the graph for more candidates than we return, then keep the closest
+    -- @top. At 1,000,000 rows, TOP_N = 10 found 0.64 to 0.86 of the true top 10;
+    -- 5x oversampling brought it to 0.94 to 0.99 (Demo 02 §3b).
+    DECLARE @top_n INT = @top * @oversample;
+
     -- SQL Server makes the embedding call. The app sends plain text.
     DECLARE @query_vector VECTOR(768) =
         AI_GENERATE_EMBEDDINGS(@prompt USE MODEL ollama);
 
     IF @mode = 'ANN' OR (@mode = 'AUTO' AND @has_index = 1)
-        SELECT
+        SELECT TOP (@top)
             p.Id                                                        AS post_id,
             p.Title                                                     AS title,
             qe.chunk                                                    AS context_chunk,
@@ -306,7 +341,7 @@ BEGIN
             COLUMN     = [embeddings],
             SIMILAR_TO = @query_vector,
             METRIC     = 'cosine',
-            TOP_N      = @top
+            TOP_N      = @top_n
         ) AS s
         JOIN dbo.Posts p ON p.Id = qe.PostId
         ORDER BY s.distance;
@@ -428,7 +463,9 @@ GO
      - INSERT, UPDATE, or DELETE anything
      - DROP or ALTER any object
      - Read the proc source (OBJECT_DEFINITION returns NULL)
-     - Access any database other than StackOverflow
+     - Do anything in another database. It has no user in any other
+       database. Like every login it can still connect to master, tempdb,
+       and msdb as guest, so its default database is set to StackOverflow.
 
    One thing it CAN see: EXECUTE on the external model makes its row in
    sys.external_models visible, endpoint URL included. Keep secrets in a
@@ -443,9 +480,13 @@ GO
 -- use Microsoft Entra ID or a policy-checked password kept in a secret store.
 IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'rag_app')
     CREATE LOGIN rag_app
-    WITH PASSWORD        = 'RagP@ss2025!',
+    WITH PASSWORD         = 'RagP@ss2025!',
+         DEFAULT_DATABASE = [StackOverflow],
          CHECK_EXPIRATION = OFF,
          CHECK_POLICY     = OFF;
+GO
+-- For a login created before this setting existed:
+ALTER LOGIN rag_app WITH DEFAULT_DATABASE = [StackOverflow];
 GO
 
 USE [StackOverflow];
@@ -573,6 +614,13 @@ GO
    the index before step 1, from exact kNN during the window, and from the
    index again after step 3. No error, no app change.
 
+   That fallback is nearly free on 10,000 rows (tens of milliseconds). It is
+   NOT free at scale. From Demo 2 §2c, an exact search over 1,000,000 rows
+   takes 160 to 340 ms and 1.7 to 2.5 CPU-seconds per query on my laptop,
+   against about 15 ms for the index. The rebuild at that size took 26.5 minutes. So at scale the
+   rebuild window needs spare CPU, a throttle or queue on search, or a
+   maintenance mode. "The app keeps working" is true. "At the same speed" isn't.
+
    The NOT EXISTS guard in step 2 makes the load resumable and idempotent.
    Kill it, rerun it, and it picks up where it left off.
 
@@ -663,7 +711,7 @@ GO
    about any near-complete replacement of your embeddings: the index was
    built for a different distribution, searches still return valid rows, but
    recall and ranking can quietly degrade. Drop and recreate the index after
-   the new vectors are loaded, then re-measure recall (Demo 02 §3a).
+   the new vectors are loaded, then re-measure recall (Demo 02 §3).
 
    Prerequisite (run on the host, ~670 MB):
        ollama pull mxbai-embed-large
@@ -854,6 +902,12 @@ GO
    SQL Server does the embedding and retrieval.
    The Python app assembles the final prompt and makes the LLM call.
    The user gets a grounded answer backed by StackOverflow content.
+
+   One design note an architect will spot: that's 1 + N round trips per
+   question (one search, then one get_top_answer per result, so 6 for K = 5).
+   On a local box it's a few milliseconds. Over a WAN, or under load, fold the
+   answer lookup into the search proc (an OUTER APPLY to the top answer) and
+   make it one call.
 ----------------------------------------------------------------------------- */
 
 -- Let's run a few representative questions to preview what the app gets back:
@@ -872,7 +926,36 @@ EXEC dbo.find_similar_questions
     @top    = 3;
 GO
 
--- Now run the app from a terminal. It logs in as rag_app and prints which
--- search path (ANN or kNN) served each question:
---     docker compose run --rm rag-app python demos/rag-app.py "how do I undo my last git commit?"
---     docker compose --profile app up rag-app-ui      (http://localhost:8501)
+/* -----------------------------------------------------------------------------
+   THE FINALE: run the app
+   -----------------------------------------------------------------------------
+   Start the web UI from a terminal and open http://localhost:8501:
+
+       docker compose --profile app up rag-app-ui
+
+   Ask it a few questions. Each answer shows which search path served it (ANN
+   or kNN) and how long retrieval took. Then show the code. This is all the
+   database work in demos/rag-app.py. The app never sees a vector:
+
+       def find_similar_questions(conn, prompt, top=TOP_K):
+           cursor = conn.cursor()
+           cursor.execute(
+               "EXEC dbo.find_similar_questions @prompt = ?, @top = ?",
+               prompt, top)
+           columns = [col[0] for col in cursor.description]
+           return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+       def get_top_answer(conn, question_post_id):
+           cursor = conn.cursor()
+           cursor.execute(
+               "EXEC dbo.get_top_answer @question_post_id = ?",
+               question_post_id)
+           ...
+
+   It connects as rag_app, sends plain text, and gets rows back. Everything
+   from this session (the type, the index, the fallback, the oversampling, the
+   permissions) sits behind those two EXEC calls.
+
+   The command-line version, if the browser misbehaves:
+       docker compose run --rm rag-app python demos/rag-app.py "how do I undo my last git commit?"
+----------------------------------------------------------------------------- */

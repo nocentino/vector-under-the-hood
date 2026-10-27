@@ -249,7 +249,8 @@ GO
 CREATE OR ALTER PROCEDURE dbo.find_similar_questions
     @prompt NVARCHAR(MAX),
     @top    INT = 5,
-    @search_mode VARCHAR(10) = 'AUTO'
+    @search_mode VARCHAR(10) = 'AUTO',
+    @oversample  INT = 5
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -267,11 +268,19 @@ BEGIN
     IF @mode = 'ANN' AND @has_index = 0
         THROW 50002, 'ANN search requires a vector index on dbo.QuestionEmbeddings.', 1;
 
+    IF @oversample IS NULL OR @oversample < 1
+        THROW 50003, '@oversample must be 1 or more.', 1;
+
+    -- Ask the graph for more candidates than we return, then keep the closest
+    -- @top. At 1,000,000 rows, TOP_N = 10 found 0.64 to 0.86 of the true top 10;
+    -- 5x oversampling brought it to 0.94 to 0.99 (Demo 02 §3b).
+    DECLARE @top_n INT = @top * @oversample;
+
     DECLARE @query_vector VECTOR(768) =
         AI_GENERATE_EMBEDDINGS(@prompt USE MODEL ollama);
 
     IF @mode = 'ANN' OR (@mode = 'AUTO' AND @has_index = 1)
-        SELECT
+        SELECT TOP (@top)
             p.Id                                                        AS post_id,
             p.Title                                                     AS title,
             qe.chunk                                                    AS context_chunk,
@@ -287,7 +296,7 @@ BEGIN
             COLUMN     = [embeddings],
             SIMILAR_TO = @query_vector,
             METRIC     = 'cosine',
-            TOP_N      = @top
+            TOP_N      = @top_n
         ) AS s
         JOIN dbo.Posts p ON p.Id = qe.PostId
         ORDER BY s.distance;
@@ -360,9 +369,13 @@ GO
 -- needs that). It can't SELECT any table directly or INSERT/UPDATE/DELETE anything.
 IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'rag_app')
     CREATE LOGIN rag_app
-    WITH PASSWORD        = 'RagP@ss2025!',
+    WITH PASSWORD         = 'RagP@ss2025!',
+         DEFAULT_DATABASE = [StackOverflow],
          CHECK_EXPIRATION = OFF,
          CHECK_POLICY     = OFF;
+GO
+-- For a login created before this setting existed:
+ALTER LOGIN rag_app WITH DEFAULT_DATABASE = [StackOverflow];
 GO
 
 USE [StackOverflow];

@@ -108,9 +108,9 @@ Here's how long things took on my M2 (CU10, Ollama on the host, October 2026):
 | Building the vector index, 10,000 rows | 10 to 12 seconds |
 | First index build after a restart | up to ~6 minutes (an earlier, slower run; I didn't see it again) |
 
-### Step 3: Build the scale database (optional, for Demo 02 §2b)
+### Step 3: Build the scale database (optional, for Demo 02 §2c and §3b)
 
-Demo 02 §2b measures exact search and the index at 1,000,000 rows. That lives in its
+Demo 02 §2c and §3b measure exact search, the index, and recall at 1,000,000 rows. That lives in its
 own database, `StackOverflowScale`, so Demo 03's drop-and-rebuild never touches it:
 
 ```bash
@@ -156,15 +156,17 @@ How a vector is stored and how SQL Server runs an exact similarity search.
 
 | Section | What you'll see |
 |---|---|
+| 0 | Where it lives: every data and log file, the `EMBEDDINGS` filegroup, and what loading embeddings costs the log |
 | 1a | The `VECTOR` type in `sys.types` and `sys.columns` |
 | 1b | `DATALENGTH`: an 8-byte header plus 768 × 4 bytes, so 3,080 bytes per vector |
-| 1b-2 | Page-level storage: the vector stays in the row, about 1.5 rows per page, and `DBCC PAGE` |
+| 1b-2 | Down to the page: pages and rows per page in one query (about 1.5), then read the vector's bytes off the page with `DBCC PAGE`, decode all 768 floats by hand, and match them to what `SELECT` prints |
 | 1c | What your client sees (a JSON array) versus what SQL Server stores (binary) |
-| 2 | `AI_GENERATE_EMBEDDINGS` and the HTTPS round trip to Ollama |
-| 3 | `VECTOR_DISTANCE` with cosine, euclidean, and dot; `VECTOR_NORM` |
-| 4 | Exact kNN: the table scan and execution plan |
+| 1d | `VECTOR(n, float16)`: half the bytes, and the mixed-types limit. The precision measurement is in the optional appendix |
+| 2 | `AI_GENERATE_EMBEDDINGS` and the HTTPS round trip to Ollama, and what it costs per row (about 15 ms, no batching) |
+| 3 | `VECTOR_DISTANCE` with cosine, euclidean, and dot: first on 3-D numbers, then on real text (a strong match near 0.1 versus a weak one past 0.5), then how a whole corpus falls off around one question |
+| 4 | Exact kNN: the table scan, a cold-cache run, how to read the parallel plan, and why a normal index can't help (4c) |
 
-For the optional float16, filegroup, and distance deep dives, run
+For the optional float16 and distance-math deep dives, run
 [demos/01-vector-internals-optional.sql](demos/01-vector-internals-optional.sql).
 
 ### Demo 02: Index Performance ([demos/02-index-performance.sql](demos/02-index-performance.sql))
@@ -173,19 +175,17 @@ What the DiskANN index is, what it costs, and where it helps and where it doesn'
 
 | Section | What you'll see |
 |---|---|
-| 1 | How DiskANN and its Vamana graph work, the build, and where the graph is stored |
-| 1d | Which DiskANN version you're on, and why the `TOP_N` syntax here is the deprecated one |
-| 2 | Reads and CPU for an exact scan versus the index, and how each one grows with row count |
-| 2-plan | The execution plan: Vector Index Seek versus Clustered Index Scan |
-| 2a | Scale: how exact kNN and ANN change as the row count grows |
-| 2b | Scale past the corpus: 1,000,000 rows in `StackOverflowScale`, reads and timing against Microsoft's ~50,000-vector guidance, and recall with and without oversampling |
-| 3 | Recall: averaged over 100 queries at K = 10 and K = 100, and what "at scale" means |
+| 1 | What DiskANN is, building the index, where the graph is stored, and which index version you're on |
+| 2a | Reads and CPU for an exact scan versus the index at 10,000 rows |
+| 2b | The execution plan: Vector Index Seek |
+| 2c | The same comparison at 1,000,000 rows in `StackOverflowScale`: about 100 times fewer reads |
+| 3 | Recall with one question at 10,000 and at 1,000,000 rows, and how oversampling `TOP_N` fixes it |
 | 4a | The table goes read-only while the index exists (Msg 42231 and 42232) |
 | 4b | A filter that silently returns zero rows, how to spot it, and how to fix it |
 | 4c | The documented limits: INT clustered key, the latest-version 100-row minimum, no temp tables, no partitioning |
 
-For filtered-search details, dimension limits, build diagnostics, and
-the latest Azure DiskANN version, see
+For build cost, filtered search, dimension limits, the latest Azure DiskANN version, and
+the measurement harnesses behind the averages (Appendix F), see
 [demos/02-index-performance-optional.sql](demos/02-index-performance-optional.sql).
 
 ### Demo 03: Application Architecture ([demos/03-application-architecture.sql](demos/03-application-architecture.sql))
@@ -194,13 +194,13 @@ The patterns behind a working RAG app, then the app itself.
 
 | Section | What you'll see |
 |---|---|
-| 1 | A separate embeddings table, and chunking long text with `AI_GENERATE_CHUNKS` |
-| 2 | A search proc that uses the index and falls back to an exact search when it's gone |
+| 1 | A separate embeddings table, and chunking long text with `AI_GENERATE_CHUNKS`, then searching the passages |
+| 2 | A search proc that uses the index (oversampling 5x for recall) and falls back to an exact search when it's gone |
 | 3 | A least-privilege login for the app, and a live demo of it being denied |
-| 4a | Loading new data: drop the index, embed, rebuild, with the app working the whole time |
+| 4a | Loading new data: drop the index, embed, rebuild, with the app working the whole time (and what the exact-search fallback costs at scale) |
 | 4b | [OPTIONAL] Moving to a different embedding model side by side |
 | 4c | Monitoring and staleness checks, run as `dba_monitor`, and what to add next |
-| 5 | The full request flow, then the app answering questions |
+| 5 | The full request flow, then the finale: the web UI answering questions, and the two `EXEC` calls behind it |
 
 ---
 
@@ -211,7 +211,9 @@ questions and their best answers, and hands that context to `llama3.2` to write 
 answer. SQL Server does the embedding and the search. The app never touches a vector.
 The procedure defaults to `AUTO`: it uses ANN when the index exists and exact kNN
 when it doesn't. You can pass `@search_mode = 'ANN'` or `'KNN'` to force a path for
-comparison; `ANN` returns Msg 50002 if the index is missing.
+comparison; `ANN` returns Msg 50002 if the index is missing. On the index path it asks the graph for 5 times as many
+candidates as it returns (`@oversample`) and keeps the closest, which keeps recall up
+at large row counts.
 
 It runs in a container, so you don't need Python or an ODBC driver on your machine.
 The image builds the first time you run it.
@@ -305,10 +307,11 @@ NGINX sits in between and adds the TLS. That's the only reason `model-web` exist
 | Feature | Where |
 |---|---|
 | `VECTOR(n)` data type | All three demos |
-| `VECTOR(n, float16)` half precision (preview) | Demo 01 optional Appendix B |
+| `VECTOR(n, float16)` half precision (preview) | Demo 01 §1d, optional Appendix A |
 | `AI_GENERATE_EMBEDDINGS` | Demo 01 §2, Demo 03 |
 | `AI_GENERATE_CHUNKS` | Demo 03 §1c |
-| `VECTOR_DISTANCE` and `VECTOR_NORM` | Demo 01 §3 |
+| `VECTOR_DISTANCE` | Demo 01 §3 |
+| `VECTOR_NORM` | Demo 01 optional Appendix B |
 | `CREATE VECTOR INDEX` (DiskANN, preview) | Demo 02 §1 |
 | `VECTOR_SEARCH` | Demo 02 §2, Demo 03 §2 |
 | `CREATE EXTERNAL MODEL` with Ollama | Demo 01 §2, Demo 03 |

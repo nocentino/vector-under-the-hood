@@ -20,3 +20,6 @@ build/
 # Editor
 .vscode/settings.json
 *.swp
+
+# Slide decks: keep the editable PowerPoint local, publish the PDF
+decks/*.pptx
