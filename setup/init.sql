@@ -84,7 +84,7 @@ GO
 -- LOCATION is the NGINX TLS reverse proxy (model-web:443) in front of host
 -- Ollama, because SQL Server 2025 requires HTTPS for external calls.
 -- Point this object at a different Ollama model and you've changed models
--- without touching a single query in the demo files (see Demo 03 Section 4b).
+-- without touching a single query in the demo files (see Demo 03 optional Appendix D).
 IF NOT EXISTS (SELECT 1 FROM sys.external_models WHERE name = N'ollama')
 BEGIN
     PRINT 'Creating EXTERNAL MODEL ollama...';
@@ -217,8 +217,8 @@ GO
 
 -- This index is what gives you Approximate Nearest Neighbor (ANN) search via
 -- VECTOR_SEARCH. Demo 02 compares ANN vs. exact kNN IO stats and recall.
--- There's no MAXDOP here: SQL Server 2025 ignores it for vector index builds
--- (documented known issue).
+-- MAXDOP = 4 caps the build at four cores. On CU10 the index option
+-- WITH (..., MAXDOP = n) is honored for the build (Demo 02 §1b has numbers).
 IF NOT EXISTS (
     SELECT 1 FROM sys.indexes
     WHERE  name      = 'vec_idx'
@@ -227,7 +227,7 @@ IF NOT EXISTS (
 BEGIN
     PRINT 'Building DiskANN vector index (vec_idx)...';
     CREATE VECTOR INDEX vec_idx ON dbo.QuestionEmbeddings([embeddings])
-    WITH (metric = 'cosine', type = 'diskann');
+    WITH (metric = 'cosine', type = 'diskann', MAXDOP = 4);
     PRINT 'Vector index built.';
 END
 ELSE
@@ -272,8 +272,8 @@ BEGIN
         THROW 50003, '@oversample must be 1 or more.', 1;
 
     -- Ask the graph for more candidates than we return, then keep the closest
-    -- @top. At 1,000,000 rows, TOP_N = 10 found 0.64 to 0.86 of the true top 10;
-    -- 5x oversampling brought it to 0.94 to 0.99 (Demo 02 §3b).
+    -- @top. At 1,000,000 rows, TOP_N = 10 found 0.84 to 0.89 of the true top 10;
+    -- 5x oversampling brought it to 0.96 to 0.98 (Demo 02 §3a).
     DECLARE @top_n INT = @top * @oversample;
 
     DECLARE @query_vector VECTOR(768) =

@@ -44,7 +44,7 @@ SQL Server applications, this one's for you. Let's go.
 | **Ollama** | Installed from [ollama.com/download](https://ollama.com/download). `start.sh` pulls the models for you |
 | **Disk space** | About 4 GB for the SQL Server image and the StackOverflow backup, plus 2 GB for `llama3.2` |
 | **Disk for the scale test** | Optional. About 12 GB for the 1,000,000-row `StackOverflowScale` database (8 GB data file, plus a 3 GB backup in `backups/`) |
-| **`mxbai-embed-large`** | Optional. Only for the model swap in Demo 03 §4b (`ollama pull mxbai-embed-large`, about 670 MB) |
+| **`mxbai-embed-large`** | Optional. Only for the model swap in Demo 03 optional Appendix D (`ollama pull mxbai-embed-large`, about 670 MB) |
 
 You don't need Python or an ODBC driver on your machine. The RAG app runs in its own container.
 
@@ -108,21 +108,29 @@ Here's how long things took on my M2 (CU10, Ollama on the host, October 2026):
 | Building the vector index, 10,000 rows | 10 to 12 seconds |
 | First index build after a restart | up to ~6 minutes (an earlier, slower run; I didn't see it again) |
 
-### Step 3: Build the scale database (optional, for Demo 02 §2c and §3b)
+### Step 3: Build the scale database (optional, for Demo 02 §2b and §3a)
 
-Demo 02 §2c and §3b measure exact search, the index, and recall at 1,000,000 rows. That lives in its
+Demo 02 §2b and §3a measure exact search, the index, and recall at 1,000,000 rows. That lives in its
 own database, `StackOverflowScale`, so Demo 03's drop-and-rebuild never touches it:
 
 ```bash
+bash setup/ollama-lb.sh start            # three more Ollama instances for the load balancer
 bash setup/build-scale-db.sh             # build it
 bash setup/build-scale-db.sh --restore   # or restore the backup it wrote
 ```
 
-Building takes about 80 minutes on my M2 (50 minutes to generate the rows and 27 minutes
-for the index), and it's safe to stop and rerun. It writes a 3 GB backup to `backups/`,
-so you only pay that once. The rows are synthetic: the 10,000 real embeddings from
-StackOverflow, each with 100 noisy copies. Use it for timing, reads, and recall, not for
-search quality.
+It's a fresh restore of StackOverflowMini with the same table as StackOverflow,
+`dbo.QuestionEmbeddings`, holding 1,000,000 real posts: all 402,278 questions (title and
+tags) and the top 597,722 answers (the first 500 characters of the answer text). The same
+queries run in both databases.
+
+Embedding a million posts one at a time would take about 4.5 hours, so the build goes
+through `model-web:444`, an NGINX load balancer in front of four Ollama instances (based on
+[ollama-lb-sql](https://github.com/nocentino/ollama-lb-sql)), with 16 SQL sessions
+embedding at once. On my M2 that took about 2 hours to embed and 35 minutes to build the
+index. It's safe to stop and rerun, and it writes a 4.4 GB
+ZSTD-compressed backup to `backups/` so you only pay that once. The demos themselves stay
+on `model-web:443` and only need your normal Ollama.
 
 ### Step 4: Run the demos
 
@@ -157,16 +165,16 @@ How a vector is stored and how SQL Server runs an exact similarity search.
 | Section | What you'll see |
 |---|---|
 | 0 | Where it lives: every data and log file, the `EMBEDDINGS` filegroup, and what loading embeddings costs the log |
-| 1a | The `VECTOR` type in `sys.types` and `sys.columns` |
-| 1b | `DATALENGTH`: an 8-byte header plus 768 × 4 bytes, so 3,080 bytes per vector |
-| 1b-2 | Down to the page: pages and rows per page in one query (about 1.5), then read the vector's bytes off the page with `DBCC PAGE`, decode all 768 floats by hand, and match them to what `SELECT` prints |
-| 1c | What your client sees (a JSON array) versus what SQL Server stores (binary) |
-| 1d | `VECTOR(n, float16)`: half the bytes, and the mixed-types limit. The precision measurement is in the optional appendix |
+| 1a | `DATALENGTH`: an 8-byte header plus 768 × 4 bytes, so 3,080 bytes per vector |
+| 1a-2 | Down to the page: pages and rows per page in one query (about 1.5), then read the vector's bytes off the page with `DBCC PAGE`, decode all 768 floats by hand, and match them to what `SELECT` prints |
+| 1b | What your client sees (a JSON array) versus what SQL Server stores (binary) |
+| 1c | `VECTOR(n, float16)`: half the bytes, and the mixed-types limit. The precision measurement is in the optional appendix |
 | 2 | `AI_GENERATE_EMBEDDINGS` and the HTTPS round trip to Ollama, and what it costs per row (about 15 ms, no batching) |
-| 3 | `VECTOR_DISTANCE` with cosine, euclidean, and dot: first on 3-D numbers, then on real text (a strong match near 0.1 versus a weak one past 0.5), then how a whole corpus falls off around one question |
+| 3 | `VECTOR_DISTANCE` with cosine, euclidean, and dot on real text: a strong match near 0.1 versus a weak one past 0.5 |
 | 4 | Exact kNN: the table scan, a cold-cache run, how to read the parallel plan, and why a normal index can't help (4c) |
 
-For the optional float16 and distance-math deep dives, run
+For float16 precision, the distance math, the `VECTOR` type in the catalog, the 3-D
+distance example, and how a whole corpus falls off around one question, run
 [demos/01-vector-internals-optional.sql](demos/01-vector-internals-optional.sql).
 
 ### Demo 02: Index Performance ([demos/02-index-performance.sql](demos/02-index-performance.sql))
@@ -175,17 +183,17 @@ What the DiskANN index is, what it costs, and where it helps and where it doesn'
 
 | Section | What you'll see |
 |---|---|
-| 1 | What DiskANN is, building the index, where the graph is stored, and which index version you're on |
-| 2a | Reads and CPU for an exact scan versus the index at 10,000 rows |
-| 2b | The execution plan: Vector Index Seek |
-| 2c | The same comparison at 1,000,000 rows in `StackOverflowScale`: about 100 times fewer reads |
-| 3 | Recall with one question at 10,000 and at 1,000,000 rows, and how oversampling `TOP_N` fixes it |
+| 1 | Turning on preview features, building the index (and what `MAXDOP` does to the build), and where the graph is stored |
+| 2a | The execution plan: Vector Index Seek |
+| 2b | Exact search versus the index at 1,000,000 rows in `StackOverflowScale`: about 100 times fewer reads |
+| 3 | Recall with one question at 1,000,000 rows, and how oversampling `TOP_N` fixes it |
 | 4a | The table goes read-only while the index exists (Msg 42231 and 42232) |
 | 4b | A filter that silently returns zero rows, how to spot it, and how to fix it |
-| 4c | The documented limits: INT clustered key, the latest-version 100-row minimum, no temp tables, no partitioning |
 
-For build cost, filtered search, dimension limits, the latest Azure DiskANN version, and
-the measurement harnesses behind the averages (Appendix F), see
+For build cost, filtered search, dimension limits, the latest Azure DiskANN version, the
+measurement harnesses behind the averages (Appendix F), what DiskANN is, which index
+version you're on, the 10,000-row comparison and recall check, and the rest of the
+documented limits (INT clustered key, no temp tables, no partitioning), see
 [demos/02-index-performance-optional.sql](demos/02-index-performance-optional.sql).
 
 ### Demo 03: Application Architecture ([demos/03-application-architecture.sql](demos/03-application-architecture.sql))
@@ -194,13 +202,17 @@ The patterns behind a working RAG app, then the app itself.
 
 | Section | What you'll see |
 |---|---|
-| 1 | A separate embeddings table, and chunking long text with `AI_GENERATE_CHUNKS`, then searching the passages |
-| 2 | A search proc that uses the index (oversampling 5x for recall) and falls back to an exact search when it's gone |
+| 1 | A separate embeddings table, and the chunk column that records what was embedded |
+| 2 | The external model the procs call, and a search proc that uses the index (oversampling 5x for recall) and falls back to an exact search when it's gone |
 | 3 | A least-privilege login for the app, and a live demo of it being denied |
 | 4a | Loading new data: drop the index, embed, rebuild, with the app working the whole time (and what the exact-search fallback costs at scale) |
-| 4b | [OPTIONAL] Moving to a different embedding model side by side |
-| 4c | Monitoring and staleness checks, run as `dba_monitor`, and what to add next |
-| 5 | The full request flow, then the finale: the web UI answering questions, and the two `EXEC` calls behind it |
+| 4b | Monitoring: is the index there, and which embeddings are stale |
+| 5 | The finale: the web UI answering questions, and the two `EXEC` calls behind it |
+
+For chunking long text with `AI_GENERATE_CHUNKS`, the `get_top_answer` walkthrough, the app
+login's full permissions, the embedding model swap, the full request flow, and more pipeline
+checks, run
+[demos/03-application-architecture-optional.sql](demos/03-application-architecture-optional.sql).
 
 ---
 
@@ -252,8 +264,8 @@ with an exact search (`kNN`).
 
 ## Trying a Different Embedding Model
 
-The stack uses `nomic-embed-text`, which produces 768-dimension vectors. Demo 03 §4b
-walks you through moving to `mxbai-embed-large` (1,024 dimensions) side by side,
+The stack uses `nomic-embed-text`, which produces 768-dimension vectors. Demo 03 optional
+Appendix D walks you through moving to `mxbai-embed-large` (1,024 dimensions) side by side,
 without taking the app down:
 
 1. Pull the model: `ollama pull mxbai-embed-large`
@@ -271,7 +283,7 @@ without taking the app down:
 | SA password | `S0methingS@Str0ng!` |
 | Database | `StackOverflow` (and `StackOverflowScale` if you built it) |
 | App login | `rag_app` / `RagP@ss2025!` |
-| Monitoring login | `dba_monitor` / `MonitorP@ss123!` (read-only, used in Demo 03 §4c) |
+| Monitoring login | `dba_monitor` / `MonitorP@ss123!` (read-only, used in Demo 03 §4b) |
 
 The stack uses port 1435 so it won't collide with a SQL Server you already have on 1433.
 These passwords are for a local demo only. Don't reuse them anywhere real.
@@ -307,14 +319,14 @@ NGINX sits in between and adds the TLS. That's the only reason `model-web` exist
 | Feature | Where |
 |---|---|
 | `VECTOR(n)` data type | All three demos |
-| `VECTOR(n, float16)` half precision (preview) | Demo 01 §1d, optional Appendix A |
+| `VECTOR(n, float16)` half precision (preview) | Demo 01 §1c, optional Appendix A |
 | `AI_GENERATE_EMBEDDINGS` | Demo 01 §2, Demo 03 |
-| `AI_GENERATE_CHUNKS` | Demo 03 §1c |
+| `AI_GENERATE_CHUNKS` | Demo 03 optional Appendix A |
 | `VECTOR_DISTANCE` | Demo 01 §3 |
 | `VECTOR_NORM` | Demo 01 optional Appendix B |
 | `CREATE VECTOR INDEX` (DiskANN, preview) | Demo 02 §1 |
 | `VECTOR_SEARCH` | Demo 02 §2, Demo 03 §2 |
-| `CREATE EXTERNAL MODEL` with Ollama | Demo 01 §2, Demo 03 |
+| `CREATE EXTERNAL MODEL` with Ollama | Demo 03 §2 |
 | `SELECT TOP (N) WITH APPROXIMATE`, `sys.dm_db_vector_indexes` | Demo 02 optional Appendix E, Azure only |
 
 ---
@@ -328,7 +340,7 @@ Here are the problems I hit while building this, and what fixes them.
 | **Msg 31629**, "external rest endpoint execution exceeded the timeout" | Ollama isn't running, or the model is still loading. Warm it up with `curl -s http://localhost:11434/api/embed -d '{"model":"nomic-embed-text","input":"hi"}'` and try again. |
 | **Msg 42231 or 42232** on INSERT, UPDATE, DELETE, or TRUNCATE | That's expected. On SQL Server 2025 a table is read-only while it has a vector index. Drop the index, load your data, rebuild it. Demo 03 §4a shows how. |
 | **Msg 42266** on `CREATE VECTOR INDEX` | Latest-version indexes (Azure SQL) need at least 100 rows with non-NULL vectors. The earlier-version index on SQL Server 2025 doesn't enforce it. |
-| **Msg 42274** on `VECTOR_SEARCH` | You're on a latest-version index (Azure SQL) and used `TOP_N`. Use `SELECT TOP (N) WITH APPROXIMATE` instead. See Demo 02 §1d. |
+| **Msg 42274** on `VECTOR_SEARCH` | You're on a latest-version index (Azure SQL) and used `TOP_N`. Use `SELECT TOP (N) WITH APPROXIMATE` instead. See Demo 02 optional Appendix I. |
 | **Msg 42227**, "Cannot find a vector index" | `VECTOR_SEARCH` needs a vector index on SQL Server 2025. Rebuild the index. |
 | The app always says `kNN` | The vector index is missing, or the app login lost `VIEW DEFINITION` on `dbo.QuestionEmbeddings`. |
 | `sql-init` exited with a non-zero code | Check `docker logs sql-init`. It's usually Ollama not being reachable from Docker. |
@@ -353,11 +365,12 @@ fresh, run `./stop.sh --wipe`, then `./start.sh` and `bash setup/expand-embeddin
 
 ```
 demos/        the three demo scripts, rag-app.py (CLI), and rag-app-ui.py (web UI)
-setup/        init.sql (run by sql-init), expand-embeddings.sh, and build-scale-db.sh
-config/       nginx.conf for the TLS proxy
+setup/        init.sql (run by sql-init), expand-embeddings.sh, build-scale-db.sh, and ollama-lb.sh
+config/       nginx.conf for the TLS proxy (:443) and the load balancer for bulk loads (:444)
 certs/        generate_ssl.sh; the certificate is created on first start
-backups/      StackOverflowMini.bak (downloaded by start.sh) and StackOverflowScale.bak
-              (written by build-scale-db.sh), neither in git
+backups/      StackOverflowMini.bak (downloaded by start.sh), plus StackOverflow.bak and
+              StackOverflowScale.bak (ZSTD-compressed backups of the two demo
+              databases). None of them are in git.
 docker-compose.yml, dockerfile.ssl, dockerfile.app, start.sh, stop.sh
 ```
 

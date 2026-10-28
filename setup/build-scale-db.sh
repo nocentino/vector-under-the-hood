@@ -1,44 +1,51 @@
 #!/usr/bin/env bash
 # setup/build-scale-db.sh
 #
-# Builds StackOverflowScale, a second database with 1,000,000 vectors for the
-# "at scale" half of Demo 02. It's separate from StackOverflow so Demo 03's
-# drop-insert-rebuild cycle never touches it, and so the slow index build
-# happens once, ahead of time.
+# Builds StackOverflowScale, a second database with 1,000,000 real posts
+# embedded, for the "at scale" half of Demo 02. It's separate from
+# StackOverflow so Demo 03's drop-insert-rebuild cycle never touches it, and so
+# the slow index build happens once, ahead of time.
 #
-# Run it from the repo root, after ./start.sh and expand-embeddings.sh:
+# Run it from the repo root, after ./start.sh:
 #
-#   bash setup/build-scale-db.sh             # build it (about an hour or more)
-#   bash setup/build-scale-db.sh --restore   # restore from backups/StackOverflowScale.bak
+#   bash setup/ollama-lb.sh start            # extra Ollama instances for the load balancer
+#   bash setup/build-scale-db.sh             # build it (about 2 hours on my M2)
+#   bash setup/build-scale-db.sh --restore   # or restore from backups/StackOverflowScale.bak
 #
-# How the data is made:
-#   The first 10,000 real embeddings from StackOverflow are the "centers".
-#   Each center gets 100 noisy copies (random noise added to every element), so
-#   the table has 1,000,000 rows that keep real topic structure. Neighbors
-#   cluster the way real text does, which makes recall at this size meaningful.
-#   The vectors are SYNTHETIC. They aren't real questions, so don't read the
-#   titles. Use it for timing and recall, not for search quality.
+# What's in it:
+#   A fresh restore of StackOverflowMini, with the same schema as StackOverflow:
+#   the EMBEDDINGS filegroup and dbo.QuestionEmbeddings (PostId, embeddings,
+#   chunk). The same queries run in both databases. It holds 1,000,000 posts:
+#     - all 402,278 questions, chunk = title + tags (same as StackOverflow)
+#     - the top 597,722 answers by score, chunk = the first 500 characters of
+#       the answer text with the HTML stripped
+#   The table name says Question, but at this scale it holds answers too.
 #
-# It's resumable. If you stop it, run it again and it continues from the last
-# complete copy. When the data and index are done it writes a compressed backup
-# to backups/ (not in git) so you can restore in minutes instead of rebuilding.
+# How it goes fast:
+#   The embeddings go through model-web:444, which load-balances across four
+#   Ollama instances (setup/ollama-lb.sh). SESSIONS sqlcmd sessions run at once,
+#   each embedding its own slice. One session through :443 is about 17 ms a row;
+#   16 sessions through :444 are about 6 ms a row. More sessions than that
+#   didn't help on my laptop: the GPU is the limit.
+#
+# It's resumable. If you stop it, run it again and it skips rows that are
+# already embedded. When the data and index are done it writes a ZSTD-compressed
+# backup to backups/ (not in git) so you can restore in minutes instead.
 #
 # Tunables (environment variables):
-#   DB       database name           (default StackOverflowScale)
-#   CENTERS  real vectors to start from (default 10000)
-#   COPIES   noisy copies per center     (default 100)
-#   NOISE    half-width of the uniform noise added to each element (default 0.05)
-#            Elements of a unit-length 768-d vector are about 0.036 in size.
+#   DB        database name                     (default StackOverflowScale)
+#   SESSIONS  parallel embedding sessions       (default 16)
+#   ROWS      posts to embed                    (default 1000000)
 
 set -euo pipefail
 
 SA_PASSWORD='S0methingS@Str0ng!'
 CONTAINER='sql1'
 DB="${DB:-StackOverflowScale}"
-CENTERS="${CENTERS:-10000}"
-COPIES="${COPIES:-100}"
-NOISE="${NOISE:-0.05}"
+SESSIONS="${SESSIONS:-16}"
+ROWS="${ROWS:-1000000}"
 BAK="/var/opt/mssql/backups/${DB}.bak"
+SRC="/var/opt/mssql/backups/StackOverflowMini.bak"
 
 run_sql() {
     docker exec "$CONTAINER" /opt/mssql-tools18/bin/sqlcmd \
@@ -65,102 +72,215 @@ RESTORE DATABASE [$DB] FROM DISK = N'$BAK' WITH REPLACE, STATS = 10;"
 fi
 
 echo "Started at: $(date)"
-echo "Database: $DB   centers: $CENTERS   copies: $COPIES   rows: $((CENTERS * COPIES))   noise: $NOISE"
+echo "Database: $DB   rows: $ROWS   sessions: $SESSIONS"
 echo ""
 
-# ── Step 1: Create the database and the tables ────────────────────────────────
+# ── Step 1: Restore StackOverflowMini as $DB, with StackOverflow's schema ─────
 # PREVIEW_FEATURES is a database scoped setting, so it has to be turned on here.
-# Compatibility level 170 matches StackOverflow. SIMPLE recovery keeps the log
-# small during the load. The data file is pre-sized so the load isn't
-# interrupted by autogrow.
-run_sql -Q "
+# SIMPLE recovery keeps the log small during the load. Two models: ollama is
+# the demo endpoint (:443), ollama_lb is the load-balanced one (:444).
+run_sql -b -Q "
 IF DB_ID(N'$DB') IS NULL
-BEGIN
-    CREATE DATABASE [$DB]
-    ON PRIMARY (NAME = N'${DB}', FILENAME = N'/var/opt/mssql/data/${DB}.mdf',
-                SIZE = 8GB, FILEGROWTH = 512MB)
-    LOG ON     (NAME = N'${DB}_log', FILENAME = N'/var/opt/mssql/data/${DB}_log.ldf',
-                SIZE = 1GB, FILEGROWTH = 512MB);
-    PRINT 'Database created.';
-END
+    RESTORE DATABASE [$DB] FROM DISK = N'$SRC'
+    WITH MOVE 'StackOverflowMini'     TO '/var/opt/mssql/data/${DB}.mdf',
+         MOVE 'StackOverflowMini_log' TO '/var/opt/mssql/data/${DB}_log.ldf',
+         STATS = 25;
+GO
 ALTER DATABASE [$DB] SET COMPATIBILITY_LEVEL = 170;
 ALTER DATABASE [$DB] SET RECOVERY SIMPLE;
 GO
 USE [$DB];
 ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;
 GO
-IF OBJECT_ID('dbo.Centers') IS NULL
-BEGIN
-    -- PostId records which real question each center came from. The recall
-    -- test uses real questions that are NOT centers as its queries.
-    CREATE TABLE dbo.Centers (Id INT NOT NULL PRIMARY KEY CLUSTERED, PostId INT NOT NULL, js NVARCHAR(MAX) NOT NULL);
-    INSERT INTO dbo.Centers (Id, PostId, js)
-    SELECT TOP ($CENTERS) ROW_NUMBER() OVER (ORDER BY PostId), PostId, CAST(embeddings AS NVARCHAR(MAX))
-    FROM StackOverflow.dbo.QuestionEmbeddings
-    ORDER BY PostId;
-END
-IF OBJECT_ID('dbo.ScaleVectors') IS NULL
-    CREATE TABLE dbo.ScaleVectors
+IF NOT EXISTS (SELECT 1 FROM sys.filegroups WHERE name = N'EMBEDDINGS')
+    ALTER DATABASE [$DB] ADD FILEGROUP [EMBEDDINGS];
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.database_files WHERE name = N'${DB}_Embeddings')
+    ALTER DATABASE [$DB] ADD FILE
+    (NAME = '${DB}_Embeddings', FILENAME = '/var/opt/mssql/data/${DB}_Embeddings.ndf',
+     SIZE = 6GB, FILEGROWTH = 512MB) TO FILEGROUP [EMBEDDINGS];
+GO
+IF OBJECT_ID('dbo.QuestionEmbeddings', 'U') IS NULL
+    CREATE TABLE dbo.QuestionEmbeddings
     (
-        Id       INT         NOT NULL,   -- (copy - 1) * centers + center
-        CenterId INT         NOT NULL,
-        v        VECTOR(768) NOT NULL,
-        CONSTRAINT PK_ScaleVectors PRIMARY KEY CLUSTERED (Id)
-    );
+        PostId     INT           NOT NULL,
+        embeddings VECTOR(768)   NOT NULL,
+        chunk      NVARCHAR(4000) NOT NULL,
+        CONSTRAINT PK_QuestionEmbeddings PRIMARY KEY (PostId)
+    ) ON [EMBEDDINGS];
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.external_models WHERE name = N'ollama')
+    CREATE EXTERNAL MODEL ollama
+    WITH (LOCATION = 'https://model-web:443/api/embed', API_FORMAT = 'Ollama',
+          MODEL_TYPE = EMBEDDINGS, MODEL = 'nomic-embed-text');
+IF NOT EXISTS (SELECT 1 FROM sys.external_models WHERE name = N'ollama_lb')
+    CREATE EXTERNAL MODEL ollama_lb
+    WITH (LOCATION = 'https://model-web:444/api/embed', API_FORMAT = 'Ollama',
+          MODEL_TYPE = EMBEDDINGS, MODEL = 'nomic-embed-text');
 GO"
 
-# ── Step 2: Generate the copies, one pass over all centers per call ───────────
-# The table is read-only once the vector index exists, so a rerun after the
-# index is built does nothing here (the row count is already at the target).
-rows=$(run_sql -d "$DB" -h -1 -W -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM dbo.ScaleVectors;" | grep -E '^[0-9]+$' | tail -1)
-rows=${rows:-0}
-copy=$(( rows / CENTERS ))
-target=$(( CENTERS * COPIES ))
-echo "[$(date '+%H:%M:%S')]  Starting at $rows rows (target $target)."
-
-gen_start=$(date +%s)
-while [ "$copy" -lt "$COPIES" ]; do
-    copy=$((copy + 1))
-    t0=$(date +%s)
-    run_sql -d "$DB" -b -Q "
+# ── Step 2: Queue the posts to embed ──────────────────────────────────────────
+# Answers have no title or tags, so an answer's chunk is its own text: the
+# first 500 characters of the body with the HTML tags stripped, entities
+# decoded, and whitespace collapsed. rn is in PostId order, so each session
+# appends to its own range of the clustered key.
+echo "[$(date '+%H:%M:%S')]  Queueing $ROWS posts ..."
+run_sql -d "$DB" -b -Q "
 SET NOCOUNT ON;
-INSERT INTO dbo.ScaleVectors (Id, CenterId, v)
-SELECT ($copy - 1) * $CENTERS + c.Id, c.Id, CAST(CONCAT('[', x.js, ']') AS VECTOR(768))
-FROM dbo.Centers c
-CROSS APPLY (
-    -- Each element: the center's value plus uniform noise. NEWID() is
-    -- non-deterministic, so it's evaluated for every element of every row.
-    -- CAST to VARCHAR(MAX): STRING_AGG stops at 8,000 bytes otherwise.
-    SELECT STRING_AGG(
-               CAST(CAST(CAST(j.[value] AS FLOAT)
-                         + (ABS(CHECKSUM(NEWID())) % 2000001 - 1000000) / 1000000.0 * $NOISE
-                    AS VARCHAR(24)) AS VARCHAR(MAX)), ',')
-           WITHIN GROUP (ORDER BY CAST(j.[key] AS INT)) AS js
-    FROM OPENJSON(c.js) AS j
-) AS x;
-GO" > /dev/null
-    echo "[$(date '+%H:%M:%S')]  Copy $copy of $COPIES done in $(( $(date +%s) - t0 )) s  ($((copy * CENTERS)) rows)"
-done
-echo "[$(date '+%H:%M:%S')]  Generation done in $(( $(date +%s) - gen_start )) seconds."
+IF OBJECT_ID('dbo.EmbedQueue') IS NULL
+BEGIN
+    CREATE TABLE dbo.EmbedQueue (rn INT NOT NULL PRIMARY KEY, PostId INT NOT NULL, chunk NVARCHAR(4000) NOT NULL);
 
-# ── Step 3: Build the vector index ────────────────────────────────────────────
+    SELECT a.Id, a.Score, t.txt
+    INTO #answers
+    FROM (SELECT TOP ($ROWS) Id, Score, LEFT(Body, 3000) AS b
+          FROM dbo.Posts WHERE PostTypeId = 2 ORDER BY Score DESC, Id) a
+    CROSS APPLY (
+        SELECT LTRIM(RTRIM(
+                 REPLACE(REPLACE(REPLACE(
+                 REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                     (SELECT STRING_AGG(CAST(CASE WHEN CHARINDEX(N'>', s.value) > 0
+                                                  THEN SUBSTRING(s.value, CHARINDEX(N'>', s.value) + 1, 4000)
+                                                  ELSE s.value END AS NVARCHAR(MAX)), N' ')
+                                        WITHIN GROUP (ORDER BY s.ordinal)
+                      FROM STRING_SPLIT(a.b, N'<', 1) s),
+                 N'&lt;', N'<'), N'&gt;', N'>'), N'&quot;', N'\"'), N'&#39;', N''''), N'&amp;', N'&'),
+                 CHAR(13), N' '), CHAR(10), N' '),
+                 N'    ', N' '), N'  ', N' '), N'  ', N' '))) AS txt
+    ) t;
+
+    WITH q AS (
+        SELECT p.Id AS PostId,
+               p.Title + N' ' + REPLACE(REPLACE(REPLACE(ISNULL(p.Tags, N''), N'><', N' '), N'<', N''), N'>', N'') AS chunk
+        FROM dbo.Posts p
+        WHERE p.PostTypeId = 1 AND p.Title IS NOT NULL
+    ), a AS (
+        SELECT TOP ($ROWS - (SELECT COUNT(*) FROM q)) Id AS PostId, LEFT(txt, 500) AS chunk
+        FROM #answers WHERE LEN(txt) >= 20
+        ORDER BY Score DESC, Id
+    )
+    INSERT INTO dbo.EmbedQueue (rn, PostId, chunk)
+    SELECT ROW_NUMBER() OVER (ORDER BY PostId), PostId, chunk
+    FROM (SELECT PostId, chunk FROM q UNION ALL SELECT PostId, chunk FROM a) x;
+END
+SELECT COUNT(*) AS queued FROM dbo.EmbedQueue;"
+
+# ── Step 2b: Held-out queries for the recall tests ────────────────────────────
+# Every question is in the table, so recall needs query vectors that aren't:
+# 100 answers that didn't make the cut, at least 200 characters of text,
+# picked by a hash of the Id so the set is the same on every build.
+run_sql -d "$DB" -b -Q "
+SET NOCOUNT ON;
+IF OBJECT_ID('dbo.HoldoutQueries') IS NULL
+BEGIN
+    CREATE TABLE dbo.HoldoutQueries (qid INT NOT NULL PRIMARY KEY, PostId INT NOT NULL,
+                                     chunk NVARCHAR(4000) NOT NULL, embeddings VECTOR(768) NULL);
+    WITH cand AS (
+        SELECT TOP (5000) p.Id, LEFT(p.Body, 3000) AS b
+        FROM dbo.Posts p
+        WHERE p.PostTypeId = 2
+          AND NOT EXISTS (SELECT 1 FROM dbo.EmbedQueue q WHERE q.PostId = p.Id)
+        ORDER BY HASHBYTES('MD5', CAST(p.Id AS VARCHAR(12)))
+    ), clean AS (
+        SELECT cand.Id, LEFT(t.txt, 500) AS chunk, LEN(t.txt) AS len
+        FROM cand
+        CROSS APPLY (
+            SELECT LTRIM(RTRIM(
+                     REPLACE(REPLACE(REPLACE(
+                     REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                         (SELECT STRING_AGG(CAST(CASE WHEN CHARINDEX(N'>', s.value) > 0
+                                                      THEN SUBSTRING(s.value, CHARINDEX(N'>', s.value) + 1, 4000)
+                                                      ELSE s.value END AS NVARCHAR(MAX)), N' ')
+                                            WITHIN GROUP (ORDER BY s.ordinal)
+                          FROM STRING_SPLIT(cand.b, N'<', 1) s),
+                     N'&lt;', N'<'), N'&gt;', N'>'), N'&quot;', N'\"'), N'&#39;', N''''), N'&amp;', N'&'),
+                     CHAR(13), N' '), CHAR(10), N' '),
+                     N'    ', N' '), N'  ', N' '), N'  ', N' '))) AS txt
+        ) t
+    )
+    INSERT INTO dbo.HoldoutQueries (qid, PostId, chunk)
+    SELECT TOP (100) ROW_NUMBER() OVER (ORDER BY HASHBYTES('MD5', CAST(Id AS VARCHAR(12)))), Id, chunk
+    FROM clean WHERE len >= 200
+    ORDER BY HASHBYTES('MD5', CAST(Id AS VARCHAR(12)));
+
+    UPDATE dbo.HoldoutQueries SET embeddings = AI_GENERATE_EMBEDDINGS(chunk USE MODEL ollama);
+END
+SELECT COUNT(*) AS holdout_queries FROM dbo.HoldoutQueries;"
+
+# ── Step 3: Embed, SESSIONS slices at once through the load balancer ──────────
+# Each session works through its slice 1,000 rows per INSERT, skipping rows
+# that are already there, and retries a failed batch. The REST call itself
+# retries too (retry_count). A parallel plan hint didn't help here: the calls
+# still went one at a time, so the concurrency comes from separate sessions.
+WORKER=$(mktemp)
+cat > "$WORKER" <<'SQL'
+SET NOCOUNT ON;
+DECLARE @lo INT = $(lo), @hi INT = $(hi), @batch INT = 1000;
+DECLARE @params JSON = N'{"sql_rest_options":{"retry_count":3}}';
+DECLARE @b INT = @lo, @e INT, @tries INT, @err INT;
+WHILE @b <= @hi
+BEGIN
+    SET @e = CASE WHEN @b + @batch - 1 > @hi THEN @hi ELSE @b + @batch - 1 END;
+    SET @tries = 0;
+    WHILE 1 = 1
+    BEGIN
+        BEGIN TRY
+            INSERT INTO dbo.QuestionEmbeddings (PostId, embeddings, chunk)
+            SELECT q.PostId, AI_GENERATE_EMBEDDINGS(q.chunk USE MODEL ollama_lb PARAMETERS @params), q.chunk
+            FROM dbo.EmbedQueue q
+            WHERE q.rn BETWEEN @b AND @e
+              AND NOT EXISTS (SELECT 1 FROM dbo.QuestionEmbeddings qe WHERE qe.PostId = q.PostId)
+            OPTION (MAXDOP 1);
+            BREAK;
+        END TRY
+        BEGIN CATCH
+            SELECT @tries += 1, @err = ERROR_NUMBER();
+            RAISERROR('slice %d-%d batch %d: Msg %d, try %d', 0, 1, @lo, @hi, @b, @err, @tries) WITH NOWAIT;
+            IF @tries >= 5 THROW;
+            WAITFOR DELAY '00:00:05';
+        END CATCH
+    END
+    SET @b = @e + 1;
+END
+SQL
+docker cp "$WORKER" "$CONTAINER:/tmp/embed_worker.sql" > /dev/null
+rm -f "$WORKER"
+
+if run_sql -d "$DB" -h -1 -W -Q "SET NOCOUNT ON; SELECT 1 FROM sys.vector_indexes WHERE object_id = OBJECT_ID('dbo.QuestionEmbeddings');" | grep -q 1; then
+    echo "[$(date '+%H:%M:%S')]  Vector index exists, so the table is read-only. Skipping embedding."
+else
+    echo "[$(date '+%H:%M:%S')]  Embedding with $SESSIONS sessions through model-web:444 ..."
+    emb_start=$(date +%s)
+    per=$(( (ROWS + SESSIONS - 1) / SESSIONS ))
+    for i in $(seq 0 $((SESSIONS - 1))); do
+        lo=$(( i * per + 1 )); hi=$(( lo + per - 1 )); [ "$hi" -gt "$ROWS" ] && hi=$ROWS
+        run_sql -d "$DB" -v lo="$lo" hi="$hi" -i /tmp/embed_worker.sql &
+    done
+    wait
+    echo "[$(date '+%H:%M:%S')]  Embedding done in $(( $(date +%s) - emb_start )) seconds."
+fi
+run_sql -d "$DB" -Q "SET NOCOUNT ON; SELECT COUNT(*) AS embedded FROM dbo.QuestionEmbeddings;"
+
+# ── Step 4: Build the vector index ────────────────────────────────────────────
 echo ""
 echo "[$(date '+%H:%M:%S')]  Building the DiskANN index. This is the slow part."
 idx_start=$(date +%s)
-run_sql -d "$DB" -Q "
-IF NOT EXISTS (SELECT 1 FROM sys.vector_indexes WHERE object_id = OBJECT_ID('dbo.ScaleVectors'))
-    CREATE VECTOR INDEX vec_idx_scale ON dbo.ScaleVectors(v)
-    WITH (metric = 'cosine', type = 'diskann');
+run_sql -d "$DB" -b -Q "
+IF NOT EXISTS (SELECT 1 FROM sys.vector_indexes WHERE object_id = OBJECT_ID('dbo.QuestionEmbeddings'))
+    CREATE VECTOR INDEX vec_idx ON dbo.QuestionEmbeddings(embeddings)
+    WITH (metric = 'cosine', type = 'diskann', MAXDOP = 4);
 GO"
 echo "[$(date '+%H:%M:%S')]  Index built in $(( $(date +%s) - idx_start )) seconds."
 
-# ── Step 4: Back it up so you can restore instead of rebuilding ───────────────
+# ── Step 5: Back it up so you can restore instead of rebuilding ───────────────
+# The queue isn't needed once everything is embedded.
+run_sql -d "$DB" -Q "DROP TABLE IF EXISTS dbo.EmbedQueue;"
 echo ""
 echo "[$(date '+%H:%M:%S')]  Writing the backup to backups/${DB}.bak ..."
-run_sql -Q "BACKUP DATABASE [$DB] TO DISK = N'$BAK' WITH COMPRESSION, INIT, STATS = 10;"
+run_sql -Q "BACKUP DATABASE [$DB] TO DISK = N'$BAK' WITH FORMAT, INIT, COMPRESSION (ALGORITHM = ZSTD), CHECKSUM, STATS = 10;"
 
 echo ""
 echo "======================================================"
-echo "  $DB is ready: $target rows, indexed, backed up."
+echo "  $DB is ready: $ROWS posts, indexed, backed up."
 echo "  Restore later with: bash setup/build-scale-db.sh --restore"
 echo "======================================================"

@@ -138,7 +138,7 @@ index_start=$(date +%s)
 
 run_sql -Q "
 CREATE VECTOR INDEX vec_idx ON dbo.QuestionEmbeddings([embeddings])
-WITH (metric = 'cosine', type = 'diskann');
+WITH (metric = 'cosine', type = 'diskann', MAXDOP = 4);
 GO
 SELECT 'Vector index built over ' + CAST(COUNT(*) AS VARCHAR(10)) + ' rows.' AS status
 FROM dbo.QuestionEmbeddings;
