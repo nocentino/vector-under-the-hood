@@ -104,8 +104,7 @@ Here's how long things took on my M2 (CU10, Ollama on the host, October 2026):
 |---|:---:|
 | Embedding 100 questions | ~2 to 3 seconds |
 | Growing to 10,000 rows | ~4 minutes |
-| Building the vector index, 1,000 rows | ~11 seconds |
-| Building the vector index, 10,000 rows | 10 to 12 seconds |
+| Building the vector index, ~10,000 rows (`MAXDOP = 4`) | ~17 to 18 seconds |
 | First index build after a restart | up to ~6 minutes (an earlier, slower run; I didn't see it again) |
 
 ### Step 3: Build the scale database (optional, for Demo 02 §2b and §3a)
@@ -166,15 +165,16 @@ How a vector is stored and how SQL Server runs an exact similarity search.
 |---|---|
 | 0 | Where it lives: every data and log file, the `EMBEDDINGS` filegroup, and what loading embeddings costs the log |
 | 1a | `DATALENGTH`: an 8-byte header plus 768 × 4 bytes, so 3,080 bytes per vector |
-| 1a-2 | Down to the page: pages and rows per page in one query (about 1.5), then read the vector's bytes off the page with `DBCC PAGE`, decode all 768 floats by hand, and match them to what `SELECT` prints |
+| 1a-2 | Down to the page: pages and rows per page in one query, then read the vector's bytes off the page with `DBCC PAGE`, decode all 768 floats by hand, and match them to what `SELECT` prints |
 | 1b | What your client sees (a JSON array) versus what SQL Server stores (binary) |
 | 1c | `VECTOR(n, float16)`: half the bytes, and the mixed-types limit. The precision measurement is in the optional appendix |
 | 2 | `AI_GENERATE_EMBEDDINGS` and the HTTPS round trip to Ollama, and what it costs per row (about 15 ms, no batching) |
 | 3 | `VECTOR_DISTANCE` with cosine, euclidean, and dot on real text: a strong match near 0.1 versus a weak one past 0.5 |
-| 4 | Exact kNN: the table scan, a cold-cache run, how to read the parallel plan, and why a normal index can't help (4c) |
+| 4 | Exact kNN: the table scan, how to read the parallel plan, and why a normal index can't help (4c) |
 
 For float16 precision, the distance math, the `VECTOR` type in the catalog, the 3-D
-distance example, and how a whole corpus falls off around one question, run
+distance example, how a whole corpus falls off around one question, embedding throughput at
+10, 50, and 100 rows, and exact search on a cold cache, run
 [demos/01-vector-internals-optional.sql](demos/01-vector-internals-optional.sql).
 
 ### Demo 02: Index Performance ([demos/02-index-performance.sql](demos/02-index-performance.sql))
@@ -183,7 +183,7 @@ What the DiskANN index is, what it costs, and where it helps and where it doesn'
 
 | Section | What you'll see |
 |---|---|
-| 1 | Turning on preview features, building the index (and what `MAXDOP` does to the build), and where the graph is stored |
+| 1 | Turning on preview features, building the index (at `MAXDOP = 4`; optional Appendix A has what MAXDOP does to a build), and where the graph is stored |
 | 2a | The execution plan: Vector Index Seek |
 | 2b | Exact search versus the index at 1,000,000 rows in `StackOverflowScale`: about 100 times fewer reads |
 | 3 | Recall with one question at 1,000,000 rows, and how oversampling `TOP_N` fixes it |
@@ -300,10 +300,11 @@ shows why.
 ```
 Your Mac
 ├── Ollama :11434          embeddings and answers, on your GPU
+├── Ollama :11435-11437    optional: extra instances for the scale build (setup/ollama-lb.sh)
 │
 └── Docker Compose
     ├── config             one time: creates a self-signed TLS certificate
-    ├── model-web          NGINX :443, forwards to Ollama over HTTPS
+    ├── model-web          NGINX: TLS on :443 in front of Ollama; :444 load-balances the scale build
     ├── sql1               SQL Server 2025 on :1435, with the data, index, and procs
     ├── sql-init           one time: restores the database and sets everything up
     └── rag-app / rag-app-ui   optional: the RAG app and its web UI on :8501
@@ -344,7 +345,7 @@ Here are the problems I hit while building this, and what fixes them.
 | **Msg 42227**, "Cannot find a vector index" | `VECTOR_SEARCH` needs a vector index on SQL Server 2025. Rebuild the index. |
 | The app always says `kNN` | The vector index is missing, or the app login lost `VIEW DEFINITION` on `dbo.QuestionEmbeddings`. |
 | `sql-init` exited with a non-zero code | Check `docker logs sql-init`. It's usually Ollama not being reachable from Docker. |
-| SSMS says "'Vector Index Seek' is not a valid value for PhysicalOpType" | Your SSMS is older than the operator. Update it, or use the plan cache query in Demo 02 §2-plan. |
+| SSMS says "'Vector Index Seek' is not a valid value for PhysicalOpType" | Your SSMS is older than the operator. Update it, or read the plan from the plan cache with Demo 02 optional Appendix F. |
 | Everything is slow right after Docker restarts | Nothing is cached yet. The first index build after a restart took me up to 6 minutes. Run it once and it settles down. |
 
 ---

@@ -325,33 +325,8 @@ GO
 SET STATISTICS TIME OFF;
 GO
 
--- 10, 50, and 100 rows, each timed on its own. The text comes from the small
--- QuestionEmbeddings table so we time the calls, not a sort of 400,000 posts.
-DECLARE @t DATETIME2 = SYSDATETIME();
-SELECT TOP (10) qe.PostId, AI_GENERATE_EMBEDDINGS(qe.chunk USE MODEL ollama) AS embedding
-INTO #e FROM dbo.QuestionEmbeddings qe ORDER BY qe.PostId;
-PRINT CONCAT('10 rows:  ', DATEDIFF(MILLISECOND, @t, SYSDATETIME()), ' ms');
-DROP TABLE #e;
-GO
-DECLARE @t DATETIME2 = SYSDATETIME();
-SELECT TOP (50) qe.PostId, AI_GENERATE_EMBEDDINGS(qe.chunk USE MODEL ollama) AS embedding
-INTO #e FROM dbo.QuestionEmbeddings qe ORDER BY qe.PostId;
-PRINT CONCAT('50 rows:  ', DATEDIFF(MILLISECOND, @t, SYSDATETIME()), ' ms');
-DROP TABLE #e;
-GO
-DECLARE @t DATETIME2 = SYSDATETIME();
-SELECT TOP (100) qe.PostId, AI_GENERATE_EMBEDDINGS(qe.chunk USE MODEL ollama) AS embedding
-INTO #e FROM dbo.QuestionEmbeddings qe ORDER BY qe.PostId;
-PRINT CONCAT('100 rows: ', DATEDIFF(MILLISECOND, @t, SYSDATETIME()), ' ms');
-DROP TABLE #e;
-GO
--- Linear: about 15 ms per row on my M2 (10 rows ~140 ms, 100 rows ~1.5 s).
--- One call per row, no batching: ~65 embeddings a second, so 1,000,000 rows
--- takes about 4 hours. Plan it like any bulk load and size the model host.
---
--- Keep AI_GENERATE_EMBEDDINGS at the top level of the query, next to the TOP.
--- Wrapped in a derived table under an aggregate, one test ran past five
--- minutes before I killed it. The plan shows how many times it runs.
+-- About 15 ms per row here, one call per row, no batching: a 1,000,000-row
+-- load takes about 4 hours. Plan it like any bulk load.
 
 
 /* =============================================================================
@@ -469,35 +444,8 @@ GO
 --   "elapsed time" grows linearly with row count. Demo 02 §2b and optional
 --   Appendix F measure it.
 
--- Now the same query on a COLD cache, so the pages have to come from disk.
--- DEV BOXES ONLY: DROPCLEANBUFFERS empties the buffer pool for the whole instance.
-CHECKPOINT;
-DBCC DROPCLEANBUFFERS;
-GO
-SET STATISTICS IO ON;
-SET STATISTICS TIME ON;
-GO
-DECLARE @query_vector VECTOR(768) = AI_GENERATE_EMBEDDINGS(N'how do I undo my last git commit?' USE MODEL ollama);
-
-WITH nearest AS (
-    SELECT TOP (10)
-        qe.PostId,
-        VECTOR_DISTANCE('cosine', @query_vector, qe.embeddings) AS distance
-    FROM dbo.QuestionEmbeddings qe
-    ORDER BY distance
-)
-SELECT p.Id, p.Title, p.Score, n.distance
-FROM nearest n
-JOIN dbo.Posts p ON p.Id = n.PostId
-ORDER BY n.distance;
-GO
-SET STATISTICS IO OFF;
-SET STATISTICS TIME OFF;
-GO
--- "read-ahead reads" on QuestionEmbeddings: about 7,000 pages on my box, and
--- 3 to 10 times slower than warm (40 to 210 ms against 8 to 25 ms). The scan
--- is sequential, so the engine reads ahead in big chunks. The EMBEDDINGS
--- filegroup's storage matters for exact search and for index builds.
+-- On a cold cache the same scan reads ~7,000 pages from disk and runs 3 to 10
+-- times slower, so the EMBEDDINGS filegroup's storage matters.
 
 
 /* -----------------------------------------------------------------------------
