@@ -16,6 +16,7 @@ GO
     E. What a whole corpus looks like around a query  (after §3a)
     F. Embedding throughput: 10, 50, and 100 rows     (after §2a)
     G. Exact kNN on a cold cache                      (after §4a)
+    H. Why a B-tree can't help                        (after §4b)
 =============================================================================
 */
 
@@ -367,3 +368,35 @@ GO
 -- 3 to 10 times slower than warm (40 to 210 ms against 8 to 25 ms). The scan
 -- is sequential, so the engine reads ahead in big chunks. The EMBEDDINGS
 -- filegroup's storage matters for exact search and for index builds.
+
+
+/* =============================================================================
+   APPENDIX H. WHY A B-TREE CAN'T HELP
+   ============================================================================= */
+
+/* -----------------------------------------------------------------------------
+   H. Why a B-tree can't help
+   -----------------------------------------------------------------------------
+   A B-tree needs a key it can compare and sort. A vector has neither: no
+   B-tree or columnstore index on a vector column, and no comparison operators.
+     https://learn.microsoft.com/en-us/sql/t-sql/data-types/vector-data-type#limitations
+
+   Three tries, three expected errors.
+----------------------------------------------------------------------------- */
+
+-- 1. A vector can't be an index key (Msg 1978):
+CREATE INDEX ix_vec_key ON dbo.QuestionEmbeddings(embeddings);
+GO
+
+-- 2. Or compared with = (Msg 8117):
+DECLARE @qv VECTOR(768) = (SELECT embeddings FROM dbo.QuestionEmbeddings WHERE PostId = 219716);
+SELECT COUNT(*) FROM dbo.QuestionEmbeddings WHERE embeddings = @qv;
+GO
+
+-- 3. Or sorted (Msg 42213):
+SELECT TOP (1) PostId FROM dbo.QuestionEmbeddings ORDER BY embeddings;
+GO
+
+-- A vector can be an INCLUDE column on a normal index, but that only copies
+-- it. "Close to" isn't something a sort order can answer, so exact kNN reads
+-- every row and the Demo 2 index is a graph, not a tree.

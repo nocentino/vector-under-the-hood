@@ -401,7 +401,8 @@ GO
    -----------------------------------------------------------------------------
        docker compose --profile app up rag-app-ui      → http://localhost:8501
 
-   Each answer shows its search path and retrieval time. The app connects as
+   Ask one question (about 10 seconds end to end on my M2). The answer shows
+   its search path and retrieval time. The app connects as
    rag_app and its database work is two calls; it never sees a vector:
 
        EXEC dbo.find_similar_questions @prompt = ?, @top = ?

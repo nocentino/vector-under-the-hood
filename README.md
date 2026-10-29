@@ -170,11 +170,11 @@ How a vector is stored and how SQL Server runs an exact similarity search.
 | 1c | `VECTOR(n, float16)`: half the bytes, and the mixed-types limit. The precision measurement is in the optional appendix |
 | 2 | `AI_GENERATE_EMBEDDINGS` and the HTTPS round trip to Ollama, and what it costs per row (about 15 ms, no batching) |
 | 3 | `VECTOR_DISTANCE` with cosine, euclidean, and dot on real text: a strong match near 0.1 versus a weak one past 0.5 |
-| 4 | Exact kNN: the table scan, how to read the parallel plan, and why a normal index can't help (4c) |
+| 4 | Exact kNN: the table scan and how to read the parallel plan |
 
 For float16 precision, the distance math, the `VECTOR` type in the catalog, the 3-D
 distance example, how a whole corpus falls off around one question, embedding throughput at
-10, 50, and 100 rows, and exact search on a cold cache, run
+10, 50, and 100 rows, exact search on a cold cache, and why a normal index can't help, run
 [demos/01-vector-internals-optional.sql](demos/01-vector-internals-optional.sql).
 
 ### Demo 02: Index Performance ([demos/02-index-performance.sql](demos/02-index-performance.sql))
