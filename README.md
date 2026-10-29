@@ -165,7 +165,7 @@ How a vector is stored and how SQL Server runs an exact similarity search.
 |---|---|
 | 0 | Where it lives: every data and log file, the `EMBEDDINGS` filegroup, and what loading embeddings costs the log |
 | 1a | `DATALENGTH`: an 8-byte header plus 768 × 4 bytes, so 3,080 bytes per vector |
-| 1a-2 | Down to the page: pages and rows per page in one query, then read the vector's bytes off the page with `DBCC PAGE`, decode all 768 floats by hand, and match them to what `SELECT` prints |
+| 1a-2 | Down to the page: pages and rows per page in one query (about 1.5), then read the vector's bytes off the page with `DBCC PAGE`, decode all 768 floats by hand, and match them to what `SELECT` prints |
 | 1b | What your client sees (a JSON array) versus what SQL Server stores (binary) |
 | 1c | `VECTOR(n, float16)`: half the bytes, and the mixed-types limit. The precision measurement is in the optional appendix |
 | 2 | `AI_GENERATE_EMBEDDINGS` and the HTTPS round trip to Ollama, and what it costs per row (about 15 ms, no batching) |

@@ -115,7 +115,7 @@ SELECT
     au.type_desc            AS allocation_unit,
     au.data_pages,
     p.rows,
-    FLOOR(p.rows * 1.0 / NULLIF(au.data_pages, 0)) AS rows_per_page
+    CAST(p.rows * 1.0 / NULLIF(au.data_pages, 0) AS DECIMAL(5,2)) AS rows_per_page
 FROM sys.partitions       p
 JOIN sys.allocation_units au ON au.container_id = p.hobt_id
 JOIN sys.filegroups       fg ON fg.data_space_id = au.data_space_id
