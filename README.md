@@ -123,7 +123,7 @@ It's a fresh restore of StackOverflowMini with the same table as StackOverflow,
 tags) and the top 597,722 answers (the first 500 characters of the answer text). The same
 queries run in both databases.
 
-Embedding a million posts one at a time would take about 4.5 hours, so the build goes
+Embedding a million posts one at a time would take about 4 hours, so the build goes
 through `model-web:444`, an NGINX load balancer in front of four Ollama instances (based on
 [ollama-lb-sql](https://github.com/nocentino/ollama-lb-sql)), with 16 SQL sessions
 embedding at once. On my M2 that took about 2 hours to embed and 35 minutes to build the

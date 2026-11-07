@@ -977,6 +977,10 @@ GO
 --               load balancer) + index 2,100 s (35 min), backup 4.4 GB (ZSTD)
 --   one query:  exact kNN 535,731 reads, 1.2 to 2 s CPU, 165 to 235 ms elapsed
 --               ANN         ~6,400 reads, about 8 ms
+--   rerun (Nov 7, §2b's question, warm): exact kNN 207 to 265 ms elapsed,
+--               1.8 to 2.3 s CPU; ANN 5,564 reads (4,680 vectors + 791
+--               worktable + 93 graph edges), 11 to 14 ms. The deck quotes
+--               the envelope: exact 175 to 265 ms, ~2 s CPU; ANN 8 to 15 ms.
 --   path  rows        elapsed ms   CPU ms
 --   kNN       10,000    21 to 26      22 to 26
 --   kNN       50,000    26 to 30      84 to 156

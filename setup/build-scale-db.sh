@@ -48,8 +48,8 @@ BAK="/var/opt/mssql/backups/${DB}.bak"
 SRC="/var/opt/mssql/backups/StackOverflowMini.bak"
 
 run_sql() {
-    docker exec "$CONTAINER" /opt/mssql-tools18/bin/sqlcmd \
-        -S localhost -U sa -P "$SA_PASSWORD" -C -I -t 0 "$@"
+    docker exec -e SQLCMDPASSWORD="$SA_PASSWORD" "$CONTAINER" /opt/mssql-tools18/bin/sqlcmd \
+        -S localhost -U sa -C -I -t 0 "$@"
 }
 
 if ! docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then

@@ -58,7 +58,7 @@ GO
    1b. Building the DiskANN index (and watching the clock)
    -----------------------------------------------------------------------------
    The build reads every vector, builds the graph, and stores it in internal
-   tables (§1c). About 17 to 18 seconds for 10,800 rows at MAXDOP 4 here.
+   tables (§1c). About 17 seconds for ~10,000 rows at MAXDOP 4 here.
 
    MAXDOP on the build is honored on CU10 and is how you share the box during
    a rebuild. While it builds, reads work, writes fail (Msg 42231), and
@@ -140,8 +140,9 @@ GO
    2a. The plan: Vector Index Seek
    -----------------------------------------------------------------------------
    Turn on the actual plan (Ctrl+M). Vector Index Seek replaces the scan and
-   the per-row Compute Scalar from Demo 1 §4b. Estimated rows say 1; the
-   optimizer doesn't estimate vector search well yet.
+   the per-row Compute Scalar from Demo 1 §4b, and there's no Sort: the seek
+   returns rows in distance order. Serial plan. Estimated rows say 1 at every
+   operator; the optimizer doesn't cost vector search yet. (The two-plans slide.)
 ----------------------------------------------------------------------------- */
 
 DECLARE @qv VECTOR(768) = AI_GENERATE_EMBEDDINGS(
@@ -199,8 +200,8 @@ GO
 -- WHAT TO LOOK FOR (CU10, my laptop):
 --                       exact kNN            ANN
 --   logical reads       535,731              5,564
---   elapsed             about 165 to 215 ms  6 to 15 ms
---   CPU                 1.2 to 1.6 seconds   6 to 15 ms
+--   elapsed             175 to 265 ms        8 to 15 ms
+--   CPU                 about 2 seconds      8 to 15 ms
 -- Same 10 results, about 96 times fewer reads.
 
 USE [StackOverflow];
@@ -247,9 +248,9 @@ SELECT
 GO
 -- On my run: 9 of 10 with TOP_N = 10, all 10 with TOP_N = 50.
 -- Averaged over 50 questions (Appendix F):
---   TOP_N = 10    recall 0.84 to 0.89    about 8 to 10 ms
+--   TOP_N = 10    recall 0.84 to 0.89    about 8 to 15 ms
 --   TOP_N = 50    recall 0.96 to 0.98    about 24 to 28 ms
---   exact kNN     recall 1.0             about 175 to 235 ms
+--   exact kNN     recall 1.0             about 175 to 265 ms
 
 USE [StackOverflow];
 GO

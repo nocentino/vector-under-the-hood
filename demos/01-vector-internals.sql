@@ -459,7 +459,7 @@ GO
    Read it right to left:
 
      Clustered Index Scan
-       Every row (10,300 here), no predicate: you have to read the vector to
+       Every row (about 10,000 here), no predicate: you have to read the vector to
        know the distance. That's the cost of exact kNN.
 
      Compute Scalar
@@ -474,7 +474,7 @@ GO
      Nested Loops + Clustered Index Seek on Posts
        10 seeks for the 10 winners (estimated 1 per seek, actual 10 total).
 
-   Estimates are right (10,300 estimated and actual), so the cost is the scan
+   Estimates are right (estimated rows = actual rows), so the cost is the scan
    and the math, not a bad plan. Parallelism flatters elapsed time; CPU time
    keeps growing with every row (Demo 2 §2b).
 

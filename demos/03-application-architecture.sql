@@ -31,6 +31,13 @@ GO
 USE [StackOverflow];
 GO
 
+-- Preflight: if an interrupted §4a left the table without its index, put it
+-- back. §2a's CREATE PROCEDURE fails with Msg 42227 without one.
+IF NOT EXISTS (SELECT 1 FROM sys.vector_indexes WHERE object_id = OBJECT_ID('dbo.QuestionEmbeddings'))
+    CREATE VECTOR INDEX vec_idx ON dbo.QuestionEmbeddings([embeddings])
+    WITH (metric = 'cosine', type = 'diskann', MAXDOP = 4);
+GO
+
 
 /* =============================================================================
    SECTION 1: SCHEMA DESIGN: WHY A SEPARATE EMBEDDINGS TABLE
@@ -41,7 +48,8 @@ GO
    -----------------------------------------------------------------------------
    QuestionEmbeddings is a satellite table to Posts, joined on PostId, on its
    own filegroup. Why not a column on Posts?
-     - A background pipeline writes it, not users, so keep the logging apart.
+     - A background pipeline writes it, not users, so its loads and rebuilds
+       stay apart from Posts.
      - Change models and you rebuild this table without touching Posts.
      - The vector index needs a single INT clustered key; you design it here.
      - Not every post needs a vector. A missing row means "not embedded yet."
@@ -62,9 +70,9 @@ GO
    1b. The chunk column: why it matters
    -----------------------------------------------------------------------------
    chunk stores the exact text that was embedded. If Posts changes and no
-   longer matches it, the vector is stale (§4b checks this). The app can also
-   hand chunk text to the LLM without a join. Long documents get split with
-   AI_GENERATE_CHUNKS (optional Appendix A).
+   longer matches it, the vector is stale (§4b checks this). The search proc
+   returns it as context_chunk, so the app sees exactly the text that matched.
+   Long documents get split with AI_GENERATE_CHUNKS (optional Appendix A).
 ----------------------------------------------------------------------------- */
 
 SELECT TOP (5)
@@ -298,8 +306,8 @@ GO
    cycle: drop the index, insert, rebuild. The proc switches to exact kNN
    during the window and back after. No error, no app change.
 
-   At 10,000 rows the fallback is nearly free. At 1,000,000 it's ~200 ms and
-   1 to 2 CPU-seconds per query, and the rebuild took 35 minutes, so plan the
+   At 10,000 rows the fallback is nearly free. At 1,000,000 it's 175 to 265 ms and
+   about 2 CPU-seconds per query, and the rebuild took 35 minutes, so plan the
    window. Azure SQL's latest-version index doesn't need any of this.
 ----------------------------------------------------------------------------- */
 

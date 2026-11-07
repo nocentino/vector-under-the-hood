@@ -35,8 +35,8 @@ BATCH=100   # 100-row batches (~20 s each) stay inside the external REST timeout
 
 # ── Helper: run sqlcmd inside the container ───────────────────────────────────
 run_sql() {
-    docker exec "$CONTAINER" /opt/mssql-tools18/bin/sqlcmd \
-        -S localhost -U sa -P "$SA_PASSWORD" -d StackOverflow -C -I "$@"
+    docker exec -e SQLCMDPASSWORD="$SA_PASSWORD" "$CONTAINER" /opt/mssql-tools18/bin/sqlcmd \
+        -S localhost -U sa -d StackOverflow -C -I "$@"
 }
 
 # ── Preflight: confirm the container is running ───────────────────────────────
