@@ -196,7 +196,7 @@ CROSS APPLY (SELECT (1 - 2 * f.sign_bit)
                   * POWER(CAST(2 AS FLOAT), f.exponent - 127) AS decoded) d;
 
 -- The first five. The bytes on the left are the numbers on the right:
-SELECT TOP (5) * FROM #floats ORDER BY element;
+SELECT  * FROM #floats ORDER BY element;
 
 -- All 768. SELECT prints 8 digits, so "match" means to those 8 digits.
 SELECT COUNT(*) AS floats_on_page,
@@ -228,20 +228,6 @@ GO
 -- Raw vector as stored internally (compact binary, 8-byte header + payload)
 SELECT TOP (1)
     qe.embeddings as raw_vector
-FROM dbo.QuestionEmbeddings qe;
-GO
-
--- What the client sees: the first 80 characters of the JSON array:
-SELECT TOP (1)
-    LEFT(CAST(qe.embeddings AS NVARCHAR(MAX)), 80) + N'...' AS json_preview
-FROM dbo.QuestionEmbeddings qe;
-GO
-
--- Roundtrip: text → VECTOR → text. JSON is just the interchange format.
-SELECT TOP (1)
-    LEFT(CAST(
-        CAST(CAST(qe.embeddings AS NVARCHAR(MAX)) AS VECTOR(768))
-    AS NVARCHAR(MAX)), 80) + N'...' AS roundtripped_json
 FROM dbo.QuestionEmbeddings qe;
 GO
 
@@ -281,19 +267,11 @@ SELECT
     DATALENGTH(CAST('[' + REPLICATE('0.1,', 767) + '0.1]' AS VECTOR(768, float16)));
 GO
 
--- The limit that bites first: you can't mix base types. Caught so you can
--- read the message.
-BEGIN TRY
-    DECLARE @v32 VECTOR(3)          = '[1.0, 0.0, 0.0]';
-    DECLARE @v16 VECTOR(3, float16) = '[1.0, 0.0, 0.0]';
-    SELECT VECTOR_DISTANCE('cosine', @v32, @v16);
-END TRY
-BEGIN CATCH
-    PRINT 'Error ' + CAST(ERROR_NUMBER() AS NVARCHAR(10)) + ': ' + ERROR_MESSAGE();
-    PRINT '=> Pick one base type per column. A direct CAST between them fails too,';
-    PRINT '   so changing your mind means converting through JSON text or re-embedding.';
-END CATCH;
-GO
+-- The limit that bites first: you can't mix base types. 
+DECLARE @v32 VECTOR(3)          = '[1.0, 0.0, 0.0]';
+DECLARE @v16 VECTOR(3, float16) = '[1.0, 0.0, 0.0]';
+SELECT VECTOR_DISTANCE('cosine', @v32, @v16);
+
 
 -- WHEN TO USE IT
 --   float16: millions of embeddings where storage matters, unit-length model
@@ -375,9 +353,7 @@ DECLARE @weak_match   VECTOR(768) = AI_GENERATE_EMBEDDINGS(
 
 SELECT
     pair,
-    VECTOR_DISTANCE('cosine',    a, b) AS cosine_distance,
-    VECTOR_DISTANCE('euclidean', a, b) AS euclidean_distance,
-    VECTOR_DISTANCE('dot',       a, b) AS dot_distance
+    VECTOR_DISTANCE('cosine',    a, b) AS cosine_distance
 FROM (VALUES
     ('question vs strong match', @question, @strong_match),
     ('question vs weak match',   @question, @weak_match)
@@ -415,6 +391,10 @@ GO
    Check the logical reads in the Messages tab: that's a full scan of the
    embeddings table.
 ----------------------------------------------------------------------------- */
+
+-- Preview the top 10 rows from the QuestionEmbeddings table to understand its structure and contents.
+SELECT TOP (10) * FROM dbo.QuestionEmbeddings qe;
+
 
 SET STATISTICS IO ON;
 SET STATISTICS TIME ON;

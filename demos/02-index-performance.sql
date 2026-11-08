@@ -15,7 +15,7 @@ GO
 
   Prerequisites:
     Demo 1 complete, QuestionEmbeddings at 10,000 rows
-    (setup/expand-embeddings.sh). §2b and §3a need StackOverflowScale
+    (setup/expand-embeddings.sh). §2b needs StackOverflowScale
     (bash setup/build-scale-db.sh, or --restore).
 
   Connect:
@@ -58,7 +58,7 @@ GO
    1b. Building the DiskANN index (and watching the clock)
    -----------------------------------------------------------------------------
    The build reads every vector, builds the graph, and stores it in internal
-   tables (§1c). About 17 seconds for ~10,000 rows at MAXDOP 4 here.
+   tables (§1c). About 8 seconds for ~10,000 rows at MAXDOP 8 here.
 
    MAXDOP on the build is honored on CU10 and is how you share the box during
    a rebuild. While it builds, reads work, writes fail (Msg 42231), and
@@ -76,7 +76,7 @@ CREATE VECTOR INDEX vec_idx ON dbo.QuestionEmbeddings([embeddings])
 WITH (
     metric  = 'cosine',    -- cosine | euclidean | dot  (must match VECTOR_DISTANCE calls)
     type    = 'diskann',   -- only DiskANN is supported
-    MAXDOP  = 4
+    MAXDOP  = 8
 );
 
 SELECT
@@ -209,59 +209,11 @@ GO
 
 
 /* =============================================================================
-   SECTION 3. RECALL: WHAT APPROXIMATE COSTS YOU
+   SECTION 3. LIMITATIONS: WHERE VECTOR INDEXES HELP AND WHERE THEY DON'T
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
-   3a. One question at 1,000,000 rows, and the fix
-   -----------------------------------------------------------------------------
-   Recall@10 = how many of the true top 10 the index found. The fix for a
-   miss: ask for more candidates (TOP_N = 50) and keep the closest 10. That's
-   oversampling.
------------------------------------------------------------------------------ */
-
-USE [StackOverflowScale];
-GO
-
-DECLARE @qv VECTOR(768) = AI_GENERATE_EMBEDDINGS(
-    N'how do I make an HTTP request in javascript' USE MODEL ollama);
-
-WITH exact_top10 AS (
-    SELECT TOP (10) qe.PostId
-    FROM dbo.QuestionEmbeddings qe
-    ORDER BY VECTOR_DISTANCE('cosine', @qv, qe.embeddings)
-),
-ann_top_n_10 AS (
-    SELECT t.PostId
-    FROM VECTOR_SEARCH(TABLE = dbo.QuestionEmbeddings AS t, COLUMN = [embeddings],
-                       SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 10) AS s
-),
-ann_top_n_50 AS (
-    SELECT TOP (10) t.PostId
-    FROM VECTOR_SEARCH(TABLE = dbo.QuestionEmbeddings AS t, COLUMN = [embeddings],
-                       SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 50) AS s
-    ORDER BY s.distance
-)
-SELECT
-    (SELECT COUNT(*) FROM ann_top_n_10 a JOIN exact_top10 e ON e.PostId = a.PostId) AS found_with_top_n_10,
-    (SELECT COUNT(*) FROM ann_top_n_50 a JOIN exact_top10 e ON e.PostId = a.PostId) AS found_with_top_n_50;
-GO
--- On my run: 9 of 10 with TOP_N = 10, all 10 with TOP_N = 50.
--- Averaged over 50 questions (Appendix F):
---   TOP_N = 10    recall 0.84 to 0.89    about 8 to 15 ms
---   TOP_N = 50    recall 0.96 to 0.98    about 24 to 28 ms
---   exact kNN     recall 1.0             about 175 to 265 ms
-
-USE [StackOverflow];
-GO
-
-
-/* =============================================================================
-   SECTION 4. LIMITATIONS: WHERE VECTOR INDEXES HELP AND WHERE THEY DON'T
-   ============================================================================= */
-
-/* -----------------------------------------------------------------------------
-   4a. LIMITATION: Read-only table after CREATE VECTOR INDEX (SQL Server 2025)
+   3a. LIMITATION: Read-only table after CREATE VECTOR INDEX (SQL Server 2025)
    -----------------------------------------------------------------------------
    With a vector index, INSERT, UPDATE, DELETE, and MERGE fail with Msg 42231
    (TRUNCATE: 42232). ALLOW_STALE_VECTOR_INDEX isn't available on SQL Server
@@ -280,7 +232,7 @@ GO
 
 
 /* -----------------------------------------------------------------------------
-   4b. STRESS TEST: the silent zero-results failure
+   3b. STRESS TEST: the silent zero-results failure
    -----------------------------------------------------------------------------
    Filters run AFTER the graph walk. Only 21 of 10,000 questions have
    Score > 5,000 (0.21%), so a small TOP_N can return nothing: no error, just

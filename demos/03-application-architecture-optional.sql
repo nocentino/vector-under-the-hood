@@ -9,9 +9,10 @@ GO
 
   Run after demos/03-application-architecture.sql. The appendices follow the
   core script's order:
-    A. Chunking long text with AI_GENERATE_CHUNKS   (after §1b)
+    A. (Chunking is now Demo 3 §1c)
     B. get_top_answer                               (after §2a)
-    C. rag_app's permissions, and two more checks   (with Section 3)
+    C. rag_app's permissions, and the checks        (with Section 3; C-0 is
+                                                     the old §3a)
     D. Model swap: a new embedding model            (after §4a; needs
                                                      mxbai-embed-large)
     E. The full call sequence                       (behind Section 5)
@@ -21,93 +22,6 @@ GO
 
 USE [StackOverflow];
 GO
-
-
-/* =============================================================================
-   APPENDIX A. CHUNKING LONG TEXT WITH AI_GENERATE_CHUNKS
-   ============================================================================= */
-
-/* -----------------------------------------------------------------------------
-   A. Chunking long text with AI_GENERATE_CHUNKS
-   -----------------------------------------------------------------------------
-   Chunk the accepted answers to a few top questions into 500-character
-   pieces with 10% overlap (so a sentence on a boundary lands in both), then
-   embed each piece.
-
-     - ChunkId is a surrogate INT key: (AnswerId, chunk_order) is the natural
-       key, but a vector index needs a single INT clustered primary key.
-     - AI_GENERATE_CHUNKS needs compatibility level 170 (init.sql sets it).
-
-   Docs: https://learn.microsoft.com/en-us/sql/t-sql/functions/ai-generate-chunks-transact-sql
------------------------------------------------------------------------------ */
-
-DROP TABLE IF EXISTS dbo.AnswerChunks;
-CREATE TABLE dbo.AnswerChunks
-(
-    ChunkId     INT IDENTITY(1,1) NOT NULL,
-    AnswerId    INT               NOT NULL,
-    chunk_order BIGINT            NOT NULL,
-    chunk       NVARCHAR(MAX)     NOT NULL,
-    embeddings  VECTOR(768)       NOT NULL,
-    CONSTRAINT PK_AnswerChunks PRIMARY KEY CLUSTERED (ChunkId)
-) ON [EMBEDDINGS];
-GO
-
--- Here's what the chunker produces for one answer:
-SELECT TOP (1) a.Id AS answer_id, c.chunk_order, c.chunk_offset, c.chunk_length, c.chunk
-FROM dbo.Posts q
-JOIN dbo.Posts a ON a.Id = q.AcceptedAnswerId
-CROSS APPLY AI_GENERATE_CHUNKS(SOURCE = a.Body, CHUNK_TYPE = FIXED,
-                               CHUNK_SIZE = 500, OVERLAP = 10) AS c
-WHERE q.Id = (SELECT TOP (1) PostId FROM dbo.QuestionEmbeddings ORDER BY PostId)
-ORDER BY c.chunk_order;
-GO
-
--- Chunk and embed the accepted answers for 5 top questions in one statement:
-INSERT INTO dbo.AnswerChunks (AnswerId, chunk_order, chunk, embeddings)
-SELECT a.Id, c.chunk_order, c.chunk,
-       AI_GENERATE_EMBEDDINGS(c.chunk USE MODEL ollama)
-FROM (SELECT TOP (5) q.AcceptedAnswerId
-      FROM dbo.Posts q
-      JOIN dbo.QuestionEmbeddings qe ON qe.PostId = q.Id
-      WHERE q.AcceptedAnswerId IS NOT NULL
-      ORDER BY q.Score DESC) AS top_q
-JOIN dbo.Posts a ON a.Id = top_q.AcceptedAnswerId
-CROSS APPLY AI_GENERATE_CHUNKS(SOURCE = a.Body, CHUNK_TYPE = FIXED,
-                               CHUNK_SIZE = 500, OVERLAP = 10) AS c;
-GO
-
-SELECT AnswerId, COUNT(*) AS chunks, SUM(LEN(chunk)) AS total_chars
-FROM dbo.AnswerChunks
-GROUP BY AnswerId;
-GO
-
-SELECT
-    AnswerId,
-    chunk_order,
-    chunk
-FROM dbo.AnswerChunks
-ORDER BY AnswerId, chunk_order;
-GO
--- In production, strip the HTML before chunking. The model embeds the tags too.
-
--- Search the passages, not the questions. A few dozen chunks means exact
--- search is the right tool (no index needed).
-DECLARE @qv VECTOR(768) = AI_GENERATE_EMBEDDINGS(
-    N'how do I undo a commit but keep my changes?' USE MODEL ollama);
-
-SELECT TOP (3)
-    c.AnswerId,
-    c.chunk_order,
-    VECTOR_DISTANCE('cosine', @qv, c.embeddings) AS distance,
-    LEFT(c.chunk, 200)                           AS passage
-FROM dbo.AnswerChunks c
-ORDER BY distance;
-GO
--- The winner is a passage from the git answer, not the whole answer: the LLM
--- gets the paragraph that answers the question, not 3,000 characters around
--- it. The repo's app still sends titles plus a trimmed answer; searching
--- chunks is the next step up.
 
 
 /* =============================================================================
@@ -163,6 +77,44 @@ GO
    ============================================================================= */
 
 -- Run Demo 3 Section 3 first, so rag_app exists with its grants.
+
+/* -----------------------------------------------------------------------------
+   C-0. Prove it: act as rag_app (was Demo 3 §3a)
+   -----------------------------------------------------------------------------
+   EXECUTE AS USER runs with only rag_app's grants; REVERT puts you back.
+----------------------------------------------------------------------------- */
+
+-- 1. Direct table access is denied (Msg 229):
+EXECUTE AS USER = 'rag_app';
+BEGIN TRY
+    SELECT TOP (1) * FROM dbo.Posts;
+END TRY
+BEGIN CATCH
+    PRINT CONCAT('Msg ', ERROR_NUMBER(), ': ', ERROR_MESSAGE());
+END CATCH;
+REVERT;
+GO
+
+-- 2. But the proc works: ownership chaining reads the tables for it.
+EXECUTE AS USER = 'rag_app';
+EXEC dbo.find_similar_questions @prompt = N'how do I undo my last git commit?', @top = 3;
+REVERT;
+GO
+
+-- 3. The VIEW DEFINITION gotcha. Revoke it and the same proc quietly takes the
+--    slow path: no error, just search_path = 'kNN'.
+REVOKE VIEW DEFINITION ON dbo.QuestionEmbeddings FROM rag_app;
+GO
+EXECUTE AS USER = 'rag_app';
+EXEC dbo.find_similar_questions @prompt = N'how do I undo my last git commit?', @top = 3;
+REVERT;
+GO
+
+-- Put it back:
+GRANT VIEW DEFINITION ON dbo.QuestionEmbeddings TO rag_app;
+GO
+USE [StackOverflow];
+GO
 
 -- The complete permission set for rag_app: EXECUTE on two procs and the model,
 -- VIEW DEFINITION on one table, and no SELECT anywhere.
@@ -229,7 +181,7 @@ GO
    Build the index AFTER the backfill. The docs warn that after a near-
    complete replacement of the vectors, an old index still returns valid
    rows but recall can quietly degrade. Recreate it, then re-measure recall
-   (Demo 02 §3).
+   (Demo 02 optional Appendix M).
 
    Prerequisite (run on the host, ~670 MB):
        ollama pull mxbai-embed-large
@@ -413,6 +365,6 @@ GO
        rank fusion). Vectors are great at meaning, weak at exact tokens like
        error codes and names.
      - A hard filter pushed into the search (tenant, date, permissions). On
-       this build filters run after the graph walk (Demo 02 §4b).
+       this build filters run after the graph walk (Demo 02 §3b).
      - Alerts on the checks in the core script's §4b and this appendix.
 */

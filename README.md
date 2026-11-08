@@ -107,9 +107,9 @@ Here's how long things took on my M2 (CU10, Ollama on the host, October 2026):
 | Building the vector index, ~10,000 rows (`MAXDOP = 4`) | ~17 to 18 seconds |
 | First index build after a restart | up to ~6 minutes (an earlier, slower run; I didn't see it again) |
 
-### Step 3: Build the scale database (optional, for Demo 02 §2b and §3a)
+### Step 3: Build the scale database (optional, for Demo 02 §2b)
 
-Demo 02 §2b and §3a measure exact search, the index, and recall at 1,000,000 rows. That lives in its
+Demo 02 §2b measures exact search and the index at 1,000,000 rows (optional Appendix M adds recall). That lives in its
 own database, `StackOverflowScale`, so Demo 03's drop-and-rebuild never touches it:
 
 ```bash
@@ -183,16 +183,16 @@ What the DiskANN index is, what it costs, and where it helps and where it doesn'
 
 | Section | What you'll see |
 |---|---|
-| 1 | Turning on preview features, building the index (at `MAXDOP = 4`; optional Appendix A has what MAXDOP does to a build), and where the graph is stored |
+| 1 | Turning on preview features, building the index (at `MAXDOP = 8`; optional Appendix A has what MAXDOP does to a build), and where the graph is stored |
 | 2a | The execution plan: Vector Index Seek |
 | 2b | Exact search versus the index at 1,000,000 rows in `StackOverflowScale`: about 100 times fewer reads |
-| 3 | Recall with one question at 1,000,000 rows, and how oversampling `TOP_N` fixes it |
-| 4a | The table goes read-only while the index exists (Msg 42231 and 42232) |
-| 4b | A filter that silently returns zero rows, how to spot it, and how to fix it |
+| 3a | The table goes read-only while the index exists (Msg 42231 and 42232) |
+| 3b | A selective filter that silently returns zero rows (a recall problem in the extreme), how to spot it, and how oversampling `TOP_N` fixes it |
 
 For build cost, filtered search, dimension limits, the latest Azure DiskANN version, the
 measurement harnesses behind the averages (Appendix F), what DiskANN is, which index
-version you're on, the 10,000-row comparison and recall check, and the rest of the
+version you're on, the 10,000-row comparison and recall check, recall on one question at
+1,000,000 rows (Appendix M), and the rest of the
 documented limits (INT clustered key, no temp tables, no partitioning), see
 [demos/02-index-performance-optional.sql](demos/02-index-performance-optional.sql).
 
@@ -202,15 +202,15 @@ The patterns behind a working RAG app, then the app itself.
 
 | Section | What you'll see |
 |---|---|
-| 1 | A separate embeddings table, and the chunk column that records what was embedded |
+| 1a, 1b | A separate embeddings table, and the chunk column that records what was embedded |
+| 1c | Chunking long text with `AI_GENERATE_CHUNKS`, embedding each chunk, and searching passages |
 | 2 | The external model the procs call, and a search proc that uses the index (oversampling 5x for recall) and falls back to an exact search when it's gone |
-| 3 | A least-privilege login for the app, and a live demo of it being denied |
+| 3 | A least-privilege login for the app (the live denial test is in optional Appendix C) |
 | 4a | Loading new data: drop the index, embed, rebuild, with the app working the whole time (and what the exact-search fallback costs at scale) |
-| 4b | Monitoring: is the index there, and which embeddings are stale |
+| 4b | Monitoring: is the index there, and which embeddings are stale. Then a chunk changes: Change Tracking finds the row, a refresh proc re-embeds it in a maintenance window, and search picks up the new meaning |
 | 5 | The finale: the web UI answering questions, and the two `EXEC` calls behind it |
 
-For chunking long text with `AI_GENERATE_CHUNKS`, the `get_top_answer` walkthrough, the app
-login's full permissions, the embedding model swap, the full request flow, and more pipeline
+For the `get_top_answer` walkthrough, the app login's full permissions and the live denial test, the embedding model swap, the full request flow, and more pipeline
 checks, run
 [demos/03-application-architecture-optional.sql](demos/03-application-architecture-optional.sql).
 
@@ -226,6 +226,11 @@ when it doesn't. You can pass `@search_mode = 'ANN'` or `'KNN'` to force a path 
 comparison; `ANN` returns Msg 50002 if the index is missing. On the index path it asks the graph for 5 times as many
 candidates as it returns (`@oversample`) and keeps the closest, which keeps recall up
 at large row counts.
+
+The prompt tells `llama3.2` to answer in the style of the Wu-Tang Clan, so the answers
+are playful. The commands and code in them still come from the retrieved context.
+To get plain answers, delete that paragraph from `build_rag_prompt` in
+[demos/rag-app.py](demos/rag-app.py) and [demos/rag-app-ui.py](demos/rag-app-ui.py).
 
 It runs in a container, so you don't need Python or an ODBC driver on your machine.
 The image builds the first time you run it.
@@ -291,7 +296,7 @@ These passwords are for a local demo only. Don't reuse them anywhere real.
 The app login can't read any table directly. It can run the two search procs and use
 the embedding model, and it has `VIEW DEFINITION` on the embeddings table. That last
 one is metadata only, and the search proc needs it to see the vector index. Demo 03
-shows why.
+optional Appendix C shows why.
 
 ---
 
@@ -322,7 +327,8 @@ NGINX sits in between and adds the TLS. That's the only reason `model-web` exist
 | `VECTOR(n)` data type | All three demos |
 | `VECTOR(n, float16)` half precision (preview) | Demo 01 §1c, optional Appendix A |
 | `AI_GENERATE_EMBEDDINGS` | Demo 01 §2, Demo 03 |
-| `AI_GENERATE_CHUNKS` | Demo 03 optional Appendix A |
+| `AI_GENERATE_CHUNKS` | Demo 03 §1c |
+| Change Tracking (re-embedding changed rows) | Demo 03 §4b |
 | `VECTOR_DISTANCE` | Demo 01 §3 |
 | `VECTOR_NORM` | Demo 01 optional Appendix B |
 | `CREATE VECTOR INDEX` (DiskANN, preview) | Demo 02 §1 |
@@ -357,8 +363,9 @@ Here are the problems I hit while building this, and what fixes them.
 ./stop.sh --wipe    # stop the containers and delete the data volume
 ```
 
-Demo 03 §4a embeds 100 more questions every time you run it. If you want to start
-fresh, run `./stop.sh --wipe`, then `./start.sh` and `bash setup/expand-embeddings.sh`.
+Demo 03 §4a embeds 100 more questions every time you run it, and §4b rewrites one post title.
+The script's last section (REHEARSAL RESET) restores that title and turns Change Tracking back off.
+If you want to start fresh, run `./stop.sh --wipe`, then `./start.sh` and `bash setup/expand-embeddings.sh`.
 
 ---
 

@@ -11,7 +11,7 @@ GO
   script's order:
     A. Index build resource cost         (extends §1 and §2a)
     B. Duplicate embeddings              (data quality before you build)
-    C. Filtered search                   (behind §4b)
+    C. Filtered search                   (behind §3b)
     D. Dimensionality constraints        (behind Appendix L)
     E. Latest-version DiskANN            (Azure SQL DB, Fabric, and Managed
                                           Instance: where this is heading)
@@ -20,8 +20,9 @@ GO
     H. What DiskANN is                   (behind §1)
     I. Which DiskANN version is this?    (after §1c)
     J. kNN vs ANN at 10,000 rows         (before §2b)
-    K. Recall at 10,000 rows             (before §3a)
-    L. The rest of the documented limits (after §4b)
+    K. Recall at 10,000 rows             (before Appendix M)
+    L. The rest of the documented limits (after §3b)
+    M. Recall on one question at 1M rows (was Demo 2 §3a)
 =============================================================================
 */
 
@@ -191,7 +192,7 @@ GO
 -- TAKEAWAY: oversample TOP_N by the inverse of the filter's pass rate. If
 -- 1 in 10 rows passes, use TOP_N = 10 × K.
 
--- The §4b query, taken apart. Score > 5,000 matches 21 of 10,000 questions.
+-- The §3b query, taken apart. Score > 5,000 matches 21 of 10,000 questions.
 -- Diagnose: drop the WHERE clause and look at the raw TOP_N = 5 candidates.
 DECLARE @search_vector VECTOR(768) = AI_GENERATE_EMBEDDINGS(N'how do I center a div in CSS' USE MODEL ollama);
 
@@ -716,7 +717,7 @@ GO
    -----------------------------------------------------------------------------
    The queries are 100 real questions NOT in QuestionEmbeddings, embedded the
    same way (title + tags): what a user's question looks like to the index.
-   §3a uses the same method at 1,000,000 rows, so the numbers compare fairly.
+   Appendix M uses the same method at 1,000,000 rows, so the numbers compare fairly.
    (Querying with vectors already in the table flatters the index: 0.99,
    against 0.95 to 0.97 this way.)
 
@@ -873,7 +874,7 @@ GO
      TOP_N = 10    ask the graph for exactly 10
      TOP_N = 50    ask for 50, keep the 10 closest
      TOP_N = 200   ask for 200, keep the 10 closest
-   The same oversampling as §4b, buying back recall instead of beating a
+   The same oversampling as §3b, buying back recall instead of beating a
    filter. The table shows what each setting costs.
 
    Columns:
@@ -1154,7 +1155,7 @@ GO
 --
 -- The real search keeps a list of the best candidates seen (L = 48 here) and
 -- explores from several, which gets past dead ends. That's why recall depends
--- on how hard the search looks, and why oversampling TOP_N helps (§3).
+-- on how hard the search looks, and why oversampling TOP_N helps (Appendix M).
 
 
 /* =============================================================================
@@ -1171,7 +1172,7 @@ GO
      - A search starts at a fixed entry node and hops to whichever neighbor is
        closest to the query until nothing closer is left.
      - It visits a tiny fraction of the table, so it's fast, and it can miss a
-       true neighbor, so it's approximate (§3 measures that).
+       true neighbor, so it's approximate (Appendix M measures that).
 */
 
 
@@ -1443,4 +1444,52 @@ BEGIN CATCH
     PRINT CONCAT('Msg ', ERROR_NUMBER(), ': ', ERROR_MESSAGE());
 END CATCH;
 DROP TABLE dbo.vt_small;
+GO
+
+
+/* =============================================================================
+   APPENDIX M. RECALL ON ONE QUESTION AT 1,000,000 ROWS
+   ============================================================================= */
+
+/* -----------------------------------------------------------------------------
+   M. One question at 1,000,000 rows, and the fix
+   -----------------------------------------------------------------------------
+   Recall@10 = how many of the true top 10 the index found. The fix for a
+   miss: ask for more candidates (TOP_N = 50) and keep the closest 10. That's
+   oversampling.
+----------------------------------------------------------------------------- */
+
+USE [StackOverflowScale];
+GO
+
+DECLARE @qv VECTOR(768) = AI_GENERATE_EMBEDDINGS(
+    N'how do I make an HTTP request in javascript' USE MODEL ollama);
+
+WITH exact_top10 AS (
+    SELECT TOP (10) qe.PostId
+    FROM dbo.QuestionEmbeddings qe
+    ORDER BY VECTOR_DISTANCE('cosine', @qv, qe.embeddings)
+),
+ann_top_n_10 AS (
+    SELECT t.PostId
+    FROM VECTOR_SEARCH(TABLE = dbo.QuestionEmbeddings AS t, COLUMN = [embeddings],
+                       SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 10) AS s
+),
+ann_top_n_50 AS (
+    SELECT TOP (10) t.PostId
+    FROM VECTOR_SEARCH(TABLE = dbo.QuestionEmbeddings AS t, COLUMN = [embeddings],
+                       SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 50) AS s
+    ORDER BY s.distance
+)
+SELECT
+    (SELECT COUNT(*) FROM ann_top_n_10 a JOIN exact_top10 e ON e.PostId = a.PostId) AS found_with_top_n_10,
+    (SELECT COUNT(*) FROM ann_top_n_50 a JOIN exact_top10 e ON e.PostId = a.PostId) AS found_with_top_n_50;
+GO
+-- On my run: 9 of 10 with TOP_N = 10, all 10 with TOP_N = 50.
+-- Averaged over 50 questions (Appendix F):
+--   TOP_N = 10    recall 0.84 to 0.89    about 8 to 15 ms
+--   TOP_N = 50    recall 0.96 to 0.98    about 24 to 28 ms
+--   exact kNN     recall 1.0             about 175 to 265 ms
+
+USE [StackOverflow];
 GO

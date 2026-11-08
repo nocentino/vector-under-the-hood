@@ -240,7 +240,7 @@ def build_rag_prompt(user_question: str, results: list[dict]) -> str:
       - Their top answers (truncated, HTML-stripped)
 
     The prompt tells the LLM to answer only from that context, and to say
-    so if the context isn't enough.
+    so if the context isn't enough. It also sets the voice: Wu-Tang style.
     """
     context_blocks: list[str] = []
 
@@ -267,6 +267,9 @@ def build_rag_prompt(user_question: str, results: list[dict]) -> str:
 
     return f"""\
 You are a helpful technical assistant grounding your answers in StackOverflow content.
+Reply in the style of the Wu-Tang Clan: Shaolin and kung-fu imagery, 36 chambers, "C.R.E.A.M.",
+"protect ya neck". Keep it playful and original (no song lyrics). The style is the voice around
+the answer; every command, code snippet and fact must stay exactly correct.
 
 Answer the user's question using ONLY the context provided below. If the context does
 not contain enough information to answer confidently, say so clearly rather than

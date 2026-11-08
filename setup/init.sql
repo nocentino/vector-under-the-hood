@@ -273,7 +273,7 @@ BEGIN
 
     -- Ask the graph for more candidates than we return, then keep the closest
     -- @top. At 1,000,000 rows, TOP_N = 10 found 0.84 to 0.89 of the true top 10;
-    -- 5x oversampling brought it to 0.96 to 0.98 (Demo 02 §3a).
+    -- 5x oversampling brought it to 0.96 to 0.98 (Demo 02 optional Appendix M).
     DECLARE @top_n INT = @top * @oversample;
 
     DECLARE @query_vector VECTOR(768) =
