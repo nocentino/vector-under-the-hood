@@ -359,12 +359,10 @@ FROM (VALUES
     ('question vs weak match',   @question, @weak_match)
 ) AS t(pair, a, b);
 GO
--- Two things to notice:
---   1. The strong match is near 0.1 and the weak match is past 0.5: the same
---      0 to 1 scale as the 3-D example on the slide.
---   2. dot_distance is cosine_distance minus 1. The vectors are unit-length,
---      so the dot product IS the cosine similarity. The math, and a check
---      that every stored vector is unit-length, are in optional Appendix B.
+-- The strong match is near 0.1 and the weak match is past 0.5: the same 0 to 1
+-- scale as the 3-D example on the slide. Euclidean and dot on the same pair,
+-- the math, and a check that every stored vector is unit-length are in
+-- optional Appendix B.
 
 
 /* =============================================================================
