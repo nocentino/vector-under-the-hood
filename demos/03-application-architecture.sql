@@ -390,7 +390,7 @@ PRINT 'Step 3: rebuild the DiskANN index.';
 DECLARE @rebuild_start DATETIME2 = SYSDATETIME();
 
 CREATE VECTOR INDEX vec_idx ON dbo.QuestionEmbeddings([embeddings])
-WITH (metric = 'cosine', type = 'diskann', MAXDOP = 4);
+WITH (metric = 'cosine', type = 'diskann', MAXDOP = 8);
 
 SELECT
     DATEDIFF(MILLISECOND, @rebuild_start, SYSDATETIME()) AS build_time_ms,
