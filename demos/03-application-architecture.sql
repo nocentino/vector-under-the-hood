@@ -7,7 +7,6 @@ GO
   SQL Server 2025 Vectors: Under the Hood and Into Production
 
   Demo 3 of 3: APPLICATION ARCHITECTURE PATTERNS
-  Schema design  ·  RAG stored procedures  ·  Security  ·  Pipeline patterns
 =============================================================================
 
   Learning objective:

@@ -7,12 +7,10 @@ GO
   SQL Server 2025 Vectors: Under the Hood and Into Production
 
   Demo 1 of 3: VECTOR DATA TYPE INTERNALS
-  Storage layout  ·  Catalog views  ·  Query execution
 =============================================================================
 
   Learning objective:
-    Describe vector internals: storage, indexing, query execution. This demo
-    is storage and exact search; indexing is Demo 2.
+    Describe vector internals: storage, indexing, query execution. 
 
   Prerequisites:
     Stack up (./start.sh). setup/init.sql embedded 1,000 rows; run
@@ -43,9 +41,6 @@ GO
    (StackOverflow_Embeddings.ndf), apart from data (.mdf) and log (.ldf).
    Vectors are big, read in bulk (scans, builds) or at random (graph walks):
    size, back up, and place them separately.
-
-   Loads are heavily logged: ~3,600 bytes per row, ~3.6 GB per 1,000,000
-   rows. Size the log for loads and rebuilds.
 ----------------------------------------------------------------------------- */
 
 -- Log files: NULL filegroup.
@@ -95,9 +90,9 @@ GO
    3,080 bytes fits in a page's ~8,060 bytes of row data: IN_ROW. A row over
    8,060 pushes its widest variable-length column to ROW_OVERFLOW_DATA (ours
    needs ~4,900 bytes of chunk text first).
+
      https://learn.microsoft.com/en-us/sql/relational-databases/pages-and-extents-architecture-guide
 
-   ~1.5 rows per page; exact kNN reads every page (STATISTICS IO, Section 4).
 ----------------------------------------------------------------------------- */
 
 -- ROW_OVERFLOW_DATA has a catalog row but zero pages.
@@ -126,8 +121,6 @@ GO
       8 bytes   the VECTOR header
    3072 bytes   768 floats, 4 bytes each (rest of the row is chunk text)
 
-   Floats are IEEE 754 little-endian: 1 sign, 8 exponent, 23 mantissa bits.
-     value = (-1)^sign × (1 + mantissa / 2^23) × 2^(exponent - 127)
 ----------------------------------------------------------------------------- */
 DECLARE @file INT, @page INT;
 SELECT TOP (1) @file = plc.file_id, @page = plc.page_id

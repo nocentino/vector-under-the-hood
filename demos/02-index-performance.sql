@@ -7,7 +7,6 @@ GO
   SQL Server 2025 Vectors: Under the Hood and Into Production
 
   Demo 2 of 3: VECTOR INDEX PERFORMANCE AND LIMITATIONS
-  Build a DiskANN index  ·  kNN vs ANN  ·  1,000,000 rows  ·  Recall  ·  Limits
 =============================================================================
 
   Learning objective:
