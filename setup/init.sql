@@ -218,7 +218,7 @@ GO
 -- This index is what gives you Approximate Nearest Neighbor (ANN) search via
 -- VECTOR_SEARCH. Demo 02 compares ANN vs. exact kNN IO stats and recall.
 -- MAXDOP = 4 caps the build at four cores. On CU10 the index option
--- WITH (..., MAXDOP = n) is honored for the build (Demo 02 §1b has numbers).
+-- WITH (..., MAXDOP = n) is honored for the build (Demo 02 - 1b has numbers).
 IF NOT EXISTS (
     SELECT 1 FROM sys.indexes
     WHERE  name      = 'vec_idx'

@@ -7,16 +7,15 @@ GO
   SQL Server 2025 Vectors: Under the Hood and Into Production
   Demo 03: Optional deep dives
 
-  Run after demos/03-application-architecture.sql. The appendices follow the
-  core script's order:
-    A. (Chunking is now Demo 3 §1c)
-    B. get_top_answer                               (after §2a)
+  Run after demos/03-application-architecture.sql. Appendices follow its order:
+    A. (Chunking is now Demo 3 - 1c)
+    B. get_top_answer                               (after 2a)
     C. rag_app's permissions, and the checks        (with Section 3; C-0 is
-                                                     the old §3a)
-    D. Model swap: a new embedding model            (after §4a; needs
+                                                     the old 3a)
+    D. Model swap: a new embedding model            (after 4a; needs
                                                      mxbai-embed-large)
     E. The full call sequence                       (behind Section 5)
-    F. More pipeline checks                         (with §4b)
+    F. More pipeline checks                         (with 4b)
 =============================================================================
 */
 
@@ -31,9 +30,7 @@ GO
 /* -----------------------------------------------------------------------------
    B. get_top_answer: fetch the best answer for a given question
    -----------------------------------------------------------------------------
-   After find_similar_questions, the app calls this once per result for
-   answer text to use as context: the accepted answer if there is one,
-   otherwise the highest-scored.
+   Called once per search result: accepted answer, else highest-scored.
 ----------------------------------------------------------------------------- */
 
 CREATE OR ALTER PROCEDURE dbo.get_top_answer
@@ -44,23 +41,22 @@ BEGIN
 
     SELECT TOP (1)
         a.Id            AS answer_id,
-        a.Body          AS answer_body,     -- HTML; Python app strips tags
+        a.Body          AS answer_body,     -- HTML; the app strips tags
         a.Score         AS answer_score,
         a.CreationDate  AS answer_date
     FROM dbo.Posts a
-    WHERE a.PostTypeId = 2                              -- answers only
-      AND a.ParentId   = @question_post_id              -- for this question
+    WHERE a.PostTypeId = 2
+      AND a.ParentId   = @question_post_id
     ORDER BY
-        -- Accepted answer first (AcceptedAnswerId is on the parent question):
+        -- Accepted answer first:
         CASE WHEN a.Id = (
             SELECT AcceptedAnswerId FROM dbo.Posts WHERE Id = @question_post_id
         ) THEN 0 ELSE 1 END,
-        a.Score DESC;   -- then highest voted
+        a.Score DESC;
 END;
 GO
 
--- The best answer for the top-scored embedded question (the app does this in
--- a loop over the search results):
+-- Top question (the app loops over results):
 DECLARE @q_id INT = (
     SELECT TOP (1) p.Id
     FROM dbo.Posts p
@@ -73,18 +69,18 @@ GO
 
 
 /* =============================================================================
-   APPENDIX C. rag_app'S PERMISSIONS, AND TWO MORE CHECKS
+   APPENDIX C. rag_app'S PERMISSIONS, AND THE CHECKS
    ============================================================================= */
 
--- Run Demo 3 Section 3 first, so rag_app exists with its grants.
+-- Run Demo 3 Section 3 first (rag_app and its grants).
 
 /* -----------------------------------------------------------------------------
-   C-0. Prove it: act as rag_app (was Demo 3 §3a)
+   C-0. Prove it: act as rag_app (was Demo 3 - 3a)
    -----------------------------------------------------------------------------
-   EXECUTE AS USER runs with only rag_app's grants; REVERT puts you back.
+   EXECUTE AS USER gives only rag_app's grants; REVERT undoes it.
 ----------------------------------------------------------------------------- */
 
--- 1. Direct table access is denied (Msg 229):
+-- 1. Direct table access denied (Msg 229):
 EXECUTE AS USER = 'rag_app';
 BEGIN TRY
     SELECT TOP (1) * FROM dbo.Posts;
@@ -95,14 +91,14 @@ END CATCH;
 REVERT;
 GO
 
--- 2. But the proc works: ownership chaining reads the tables for it.
+-- 2. The proc works (ownership chaining).
 EXECUTE AS USER = 'rag_app';
 EXEC dbo.find_similar_questions @prompt = N'how do I undo my last git commit?', @top = 3;
 REVERT;
 GO
 
--- 3. The VIEW DEFINITION gotcha. Revoke it and the same proc quietly takes the
---    slow path: no error, just search_path = 'kNN'.
+-- 3. VIEW DEFINITION gotcha: revoke it and the proc quietly goes slow, no
+--    error, just search_path = 'kNN'.
 REVOKE VIEW DEFINITION ON dbo.QuestionEmbeddings FROM rag_app;
 GO
 EXECUTE AS USER = 'rag_app';
@@ -110,14 +106,13 @@ EXEC dbo.find_similar_questions @prompt = N'how do I undo my last git commit?', 
 REVERT;
 GO
 
--- Put it back:
 GRANT VIEW DEFINITION ON dbo.QuestionEmbeddings TO rag_app;
 GO
 USE [StackOverflow];
 GO
 
--- The complete permission set for rag_app: EXECUTE on two procs and the model,
--- VIEW DEFINITION on one table, and no SELECT anywhere.
+-- rag_app's full set: EXECUTE on two procs and the model, VIEW
+-- DEFINITION on one table, no SELECT.
 SELECT
     dp.class_desc                           AS object_class,
     COALESCE(
@@ -134,11 +129,10 @@ WHERE u.name = N'rag_app'
 ORDER BY dp.class_desc, object_name;
 GO
 
--- EXECUTE on the model makes its sys.external_models row visible to rag_app,
--- endpoint URL included. Keep secrets in a database scoped credential, never
--- in LOCATION.
+-- EXECUTE on the model exposes its sys.external_models row, URL included.
+-- Keep secrets in a database scoped credential, never in LOCATION.
 
--- C-1. The vector column is off limits too:
+-- C-1. The vector column is off limits:
 EXECUTE AS USER = 'rag_app';
 BEGIN TRY
     SELECT TOP (1) embeddings FROM dbo.QuestionEmbeddings;
@@ -150,7 +144,7 @@ REVERT;
 GO
 
 
--- C-2. The proc source is hidden from the app:
+-- C-2. The proc source is hidden:
 EXECUTE AS USER = 'rag_app';
 SELECT OBJECT_DEFINITION(OBJECT_ID('dbo.find_similar_questions')) AS proc_source;   -- NULL
 REVERT;
@@ -164,36 +158,34 @@ GO
 /* -----------------------------------------------------------------------------
    D. Model swap: a new embedding model, side by side
    -----------------------------------------------------------------------------
-   Queries name the model, not the endpoint. But changing models is more than
-   a rename: vectors from two models aren't comparable, and the dimension
-   count usually changes (mxbai-embed-large is 1,024; our column is 768).
+   A swap is more than a rename: vectors from different models aren't
+   comparable and dimensions usually change (mxbai-embed-large is 1,024; ours
+   is 768).
 
-   The pattern that keeps the app online:
+   Keeping the app online:
 
-     1. Register the new model next to the old one
-     2. Build a second satellite table with the new VECTOR(n)
-     3. Backfill it and build its vector index
-     4. CREATE OR ALTER the proc to point at the new table and model
+     1. Register the new model
+     2. Second satellite table, new VECTOR(n)
+     3. Backfill, build its vector index
+     4. CREATE OR ALTER the proc for the new table and model
      5. Drop the old table and model
 
    The app never changes; step 4 is a one-statement cutover.
 
-   Build the index AFTER the backfill. The docs warn that after a near-
-   complete replacement of the vectors, an old index still returns valid
-   rows but recall can quietly degrade. Recreate it, then re-measure recall
-   (Demo 02 optional Appendix M).
+   Build the index AFTER the backfill: after a near-complete vector replacement
+   an old index still returns valid rows but recall can quietly degrade (docs).
+   Recreate it, re-measure recall (Demo 02 optional Appendix M).
 
-   Prerequisite (run on the host, ~670 MB):
+   Prerequisite (host, ~670 MB):
        ollama pull mxbai-embed-large
 
-   Warm it up first; a cold model can exceed the REST timeout (Msg 31629):
+   Warm it up; a cold model can exceed the REST timeout (Msg 31629):
        curl -s http://localhost:11434/api/embed \
             -d '{"model":"mxbai-embed-large","input":"warm up"}' > /dev/null
 
-   The 1,000-row backfill below takes about two minutes on an M2.
+   The 1,000-row backfill takes ~2 minutes on an M2.
 ----------------------------------------------------------------------------- */
 
--- The current model registration:
 SELECT
     name,
     location,
@@ -204,7 +196,7 @@ FROM sys.external_models;
 GO
 
 /*
--- Step 1: register the second model on the same Ollama endpoint.
+-- Step 1: second model.
 CREATE EXTERNAL MODEL ollama_mxbai
 WITH (
     LOCATION   = 'https://model-web:443/api/embed',
@@ -214,14 +206,11 @@ WITH (
 );
 GO
 
--- The dimension count is a property of the model. Check it before you
--- design the column:
 DECLARE @v NVARCHAR(MAX) =
     CAST(AI_GENERATE_EMBEDDINGS(N'dimension check' USE MODEL ollama_mxbai) AS NVARCHAR(MAX));
 SELECT COUNT(*) AS dimensions FROM OPENJSON(@v);   -- 1024
 GO
 
--- Steps 2-3: second satellite table, backfill, index.
 CREATE TABLE dbo.QuestionEmbeddings_mxbai
 (
     PostId     INT            NOT NULL,
@@ -235,15 +224,14 @@ INSERT INTO dbo.QuestionEmbeddings_mxbai (PostId, chunk, embeddings)
 SELECT TOP (1000) qe.PostId, qe.chunk, AI_GENERATE_EMBEDDINGS(qe.chunk USE MODEL ollama_mxbai)
 FROM dbo.QuestionEmbeddings qe
 JOIN dbo.Posts p ON p.Id = qe.PostId
-ORDER BY p.Score DESC;   -- the same top questions the 768-dim table started with
+ORDER BY p.Score DESC;   -- same top questions as 768-dim
 GO
 
 CREATE VECTOR INDEX vec_idx_mxbai ON dbo.QuestionEmbeddings_mxbai([embeddings])
 WITH (metric = 'cosine', type = 'diskann');
 GO
 
--- Same question, both models. Distances aren't comparable across models;
--- compare which questions come back.
+-- Same question, both models; compare questions, not distances.
 DECLARE @q768  VECTOR(768)  = AI_GENERATE_EMBEDDINGS(N'how do I undo my last git commit?' USE MODEL ollama);
 DECLARE @q1024 VECTOR(1024) = AI_GENERATE_EMBEDDINGS(N'how do I undo my last git commit?' USE MODEL ollama_mxbai);
 
@@ -258,12 +246,11 @@ FROM VECTOR_SEARCH(TABLE = dbo.QuestionEmbeddings_mxbai AS t, COLUMN = [embeddin
 JOIN dbo.Posts p ON p.Id = t.PostId;
 GO
 
--- Step 4: CREATE OR ALTER dbo.find_similar_questions with VECTOR(1024),
--- USE MODEL ollama_mxbai, and TABLE = dbo.QuestionEmbeddings_mxbai.
--- GRANT EXECUTE ON EXTERNAL MODEL::ollama_mxbai TO rag_app; first, and
--- GRANT VIEW DEFINITION on the new table (see the core script, §2a).
+-- Step 4: re-create find_similar_questions for VECTOR(1024), ollama_mxbai and
+-- the _mxbai table. First GRANT EXECUTE ON EXTERNAL MODEL::ollama_mxbai TO
+-- rag_app, plus VIEW DEFINITION on the new table (core 2a).
 
--- Cleanup, so the demo can be re-run:
+-- Cleanup:
 DROP TABLE IF EXISTS dbo.QuestionEmbeddings_mxbai;
 DROP EXTERNAL MODEL ollama_mxbai;
 GO
@@ -275,7 +262,7 @@ GO
    ============================================================================= */
 
 /* -----------------------------------------------------------------------------
-   What happens when rag-app.py gets a question:
+   When rag-app.py gets a question:
 
      APP                     SQL SERVER                        OLLAMA
       │                           │                               │
@@ -305,15 +292,11 @@ GO
       │                           │                               │
       │  Display grounded answer  │                               │
 
-   SQL Server embeds and retrieves; the app builds the prompt and calls the
-   LLM.
-
-   That's 1 + N round trips per question (6 for K = 5): a few ms locally.
-   Over a WAN or under load, fold the answer lookup into the search proc
-   (OUTER APPLY to the top answer) and make it one call.
+   1 + N round trips per question (6 for K = 5), a few ms locally. Over a WAN or
+   under load, fold the lookup into the search proc (OUTER APPLY the top
+   answer): one call.
 ----------------------------------------------------------------------------- */
 
--- What the app gets back for a few typical questions:
 EXEC dbo.find_similar_questions
     @prompt = N'what is the difference between a list and a tuple in Python?',
     @top    = 3;
@@ -334,12 +317,10 @@ GO
    APPENDIX F. MORE PIPELINE CHECKS
    ============================================================================= */
 
--- The server-level switch that allows outbound REST calls (needed for
--- AI_GENERATE_EMBEDDINGS):
+-- Outbound REST switch (needed by AI_GENERATE_EMBEDDINGS):
 EXEC sp_configure 'external rest endpoint enabled';
 GO
 
--- Coverage: embedded questions versus the backlog still to embed.
 SELECT
     (SELECT COUNT(*) FROM dbo.QuestionEmbeddings)                                AS embedded,
     (SELECT COUNT(*) FROM dbo.Posts WHERE PostTypeId = 1 AND Title IS NOT NULL)  AS embeddable,
@@ -347,7 +328,7 @@ SELECT
       - (SELECT COUNT(*) FROM dbo.QuestionEmbeddings)                            AS backlog;
 GO
 
--- The coverage gap: top questions not embedded yet.
+-- Top questions not embedded:
 SELECT TOP (10)
     p.Id,
     p.Title,
@@ -361,10 +342,9 @@ GO
 
 /*
    WHAT I'D ADD NEXT, NOT BUILT HERE
-     - Hybrid search: merge vector search with full-text results (reciprocal
-       rank fusion). Vectors are great at meaning, weak at exact tokens like
-       error codes and names.
-     - A hard filter pushed into the search (tenant, date, permissions). On
-       this build filters run after the graph walk (Demo 02 §3b).
-     - Alerts on the checks in the core script's §4b and this appendix.
+     - Hybrid search: vector plus full-text results via reciprocal rank fusion;
+       vectors miss exact tokens (error codes, names).
+     - Hard filter in the search (tenant, date, permissions); here it runs
+       after the graph walk (Demo 02 - 3b).
+     - Alerts on the checks in core 4b and here.
 */

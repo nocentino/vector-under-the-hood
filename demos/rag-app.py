@@ -22,6 +22,7 @@ SQL Server 2025: dbo.get_top_answer (per result)
     ▼
 RAG prompt assembly
     └── "Answer this question using the following StackOverflow context..."
+        (and asks for the answer in Wu-Tang style)
     │
     ▼
 Ollama LLM (llama3.2, mistral, etc.): direct HTTP call from Python

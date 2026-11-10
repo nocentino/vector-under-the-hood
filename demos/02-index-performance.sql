@@ -13,19 +13,17 @@ GO
   Learning objective:
     Evaluate vector index performance and limitations at scale.
 
-  Prerequisites:
-    Demo 1 complete, QuestionEmbeddings at 10,000 rows
-    (setup/expand-embeddings.sh). §2b needs StackOverflowScale
+  Prerequisites: Demo 1 done, QuestionEmbeddings at 10,000 rows
+    (setup/expand-embeddings.sh). 2b needs StackOverflowScale
     (bash setup/build-scale-db.sh, or --restore).
 
   Connect:
     Server:   localhost,1435
     Login:    sa
-    Password: S0methingS@Str0ng!   (demo only)
+    Password: S0methingS@Str0ng!   (demo)
 
-  Run the sections top to bottom. Every one is idempotent.
-  Deep dives and the measurements behind these numbers:
-  demos/02-index-performance-optional.sql.
+  Run top to bottom; all idempotent.
+  Deep dives: demos/02-index-performance-optional.sql.
 =============================================================================
 */
 
@@ -40,7 +38,7 @@ GO
 /* -----------------------------------------------------------------------------
    1a. Turn on preview features
    -----------------------------------------------------------------------------
-   The vector index is a PREVIEW feature in SQL Server 2025. Opt in per database.
+   PREVIEW in SQL Server 2025; opt in per database.
 ----------------------------------------------------------------------------- */
 
 ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;
@@ -57,14 +55,10 @@ GO
 /* -----------------------------------------------------------------------------
    1b. Building the DiskANN index (and watching the clock)
    -----------------------------------------------------------------------------
-   The build reads every vector, builds the graph, and stores it in internal
-   tables (§1c). About 8 seconds for ~10,000 rows at MAXDOP 8 here.
-
-   MAXDOP on the build is honored on CU10 and is how you share the box during
-   a rebuild. While it builds, reads work, writes fail (Msg 42231), and
-   VECTOR_SEARCH fails (Msg 42227). Numbers: optional Appendix A.
-
-   The "join order has been enforced" warning is a known issue; ignore it.
+   Graph goes to internal tables (1c). ~8 s, ~10,000 rows, MAXDOP 8.
+   MAXDOP honored on CU10 (share the box on rebuild). Build: reads work,
+   writes fail (Msg 42231), VECTOR_SEARCH fails (Msg 42227).
+   Appendix A: numbers. Ignore "join order has been enforced".
 ----------------------------------------------------------------------------- */
 
 DROP INDEX IF EXISTS vec_idx ON dbo.QuestionEmbeddings;
@@ -74,8 +68,8 @@ DECLARE @build_start DATETIME2 = SYSDATETIME();
 
 CREATE VECTOR INDEX vec_idx ON dbo.QuestionEmbeddings([embeddings])
 WITH (
-    metric  = 'cosine',    -- cosine | euclidean | dot  (must match VECTOR_DISTANCE calls)
-    type    = 'diskann',   -- only DiskANN is supported
+    metric  = 'cosine',    -- cosine | euclidean | dot (match VECTOR_DISTANCE)
+    type    = 'diskann',   -- only option
     MAXDOP  = 8
 );
 
@@ -88,11 +82,11 @@ GO
 /* -----------------------------------------------------------------------------
    1c. Inspecting the index in the catalog
    -----------------------------------------------------------------------------
-   build_parameters is "internal usage only", but readable:
-     StartId  the entry node: a real PostId near the center of all the vectors
+   build_parameters ("internal usage only"):
+     StartId  entry node: real PostId near the vectors' center
      R        max edges per node (48)
-     L        candidate list size during the build (48)
-   No "Version" key means the earlier-version index (SQL Server 2025).
+     L        build candidate list size (48)
+   No "Version" key = earlier-version index (2025).
 ----------------------------------------------------------------------------- */
 
 SELECT
@@ -102,7 +96,7 @@ SELECT
     JSON_VALUE(v.build_parameters, '$.StartId')     AS start_node,
     JSON_VALUE(v.build_parameters, '$.R')           AS max_degree_R,
     JSON_VALUE(v.build_parameters, '$.L')           AS build_list_L,
-    JSON_VALUE(v.build_parameters, '$.Version')     AS index_version,    -- NULL = earlier-version
+    JSON_VALUE(v.build_parameters, '$.Version')     AS index_version,    -- NULL = earlier
     v.build_parameters
 FROM sys.vector_indexes v
 JOIN sys.indexes        i  ON i.object_id = v.object_id
@@ -117,8 +111,7 @@ JOIN dbo.Posts p ON p.Id = CAST(JSON_VALUE(v.build_parameters, '$.StartId') AS I
 WHERE v.object_id = OBJECT_ID('dbo.QuestionEmbeddings');
 GO
 
--- The graph lives in internal tables owned by the base table. The quantization
--- table stays at 0 pages: this earlier-version index walks the full vectors.
+-- Graph tables. Quantization: 0 pages (full vectors walked).
 SELECT
     it.name                     AS internal_table,
     it.internal_type_desc,
@@ -139,10 +132,9 @@ GO
 /* -----------------------------------------------------------------------------
    2a. The plan: Vector Index Seek
    -----------------------------------------------------------------------------
-   Turn on the actual plan (Ctrl+M). Vector Index Seek replaces the scan and
-   the per-row Compute Scalar from Demo 1 §4b, and there's no Sort: the seek
-   returns rows in distance order. Serial plan. Estimated rows say 1 at every
-   operator; the optimizer doesn't cost vector search yet. (The two-plans slide.)
+   Actual plan (Ctrl+M). Vector Index Seek replaces Demo 1 - 4b's scan and
+   Compute Scalar; no Sort. Serial. Estimated rows 1 everywhere (no vector
+   costing). (Two-plans slide.)
 ----------------------------------------------------------------------------- */
 
 DECLARE @qv VECTOR(768) = AI_GENERATE_EMBEDDINGS(
@@ -168,9 +160,8 @@ GO
 /* -----------------------------------------------------------------------------
    2b. Past the line: 1,000,000 vectors
    -----------------------------------------------------------------------------
-   10,000 rows is under Microsoft's ~50,000-vector guidance for exact search.
-   StackOverflowScale has 1,000,000 real posts and its own index. The query is
-   typed text; it isn't in the table.
+   10,000 is under Microsoft's ~50,000-vector exact-search line.
+   StackOverflowScale: 1,000,000 real posts, own index.
 ----------------------------------------------------------------------------- */
 
 USE [StackOverflowScale];
@@ -197,12 +188,12 @@ ORDER BY s.distance;
 SET STATISTICS IO OFF;
 SET STATISTICS TIME OFF;
 GO
--- WHAT TO LOOK FOR (CU10, my laptop):
+-- LOOK FOR (CU10, my laptop):
 --                       exact kNN            ANN
 --   logical reads       535,731              5,564
 --   elapsed             175 to 265 ms        8 to 15 ms
---   CPU                 about 2 seconds      8 to 15 ms
--- Same 10 results, about 96 times fewer reads.
+--   CPU                 ~2 seconds           8 to 15 ms
+-- Same 10 results, ~96x fewer reads.
 
 USE [StackOverflow];
 GO
@@ -215,13 +206,12 @@ GO
 /* -----------------------------------------------------------------------------
    3a. LIMITATION: Read-only table after CREATE VECTOR INDEX (SQL Server 2025)
    -----------------------------------------------------------------------------
-   With a vector index, INSERT, UPDATE, DELETE, and MERGE fail with Msg 42231
-   (TRUNCATE: 42232). ALLOW_STALE_VECTOR_INDEX isn't available on SQL Server
-   2025. Workaround: drop, insert, rebuild (Demo 3 §4a). The latest-version
-   index on Azure SQL is fully writable.
+   INSERT, UPDATE, DELETE, MERGE fail: Msg 42231 (TRUNCATE: 42232).
+   No ALLOW_STALE_VECTOR_INDEX on 2025. Fix: drop, insert, rebuild
+   (Demo 3 - 4a). Azure SQL latest-version index: writable.
 ----------------------------------------------------------------------------- */
 
--- Msg 42231 is a compile-time error, so TRY/CATCH can't catch it here.
+-- Compile-time Msg 42231: TRY/CATCH can't catch it.
 INSERT INTO dbo.QuestionEmbeddings (PostId, chunk, embeddings)
 VALUES (
     999999,
@@ -234,13 +224,12 @@ GO
 /* -----------------------------------------------------------------------------
    3b. STRESS TEST: the silent zero-results failure
    -----------------------------------------------------------------------------
-   Filters run AFTER the graph walk. Only 21 of 10,000 questions have
-   Score > 5,000 (0.21%), so a small TOP_N can return nothing: no error, just
-   zero rows. Exact kNN finds 5 matches for this query. Optional Appendix C
-   shows the raw candidates and that ground truth.
+   Filters run AFTER the walk. Only 21 of 10,000 questions have Score > 5,000
+   (0.21%), so small TOP_N returns zero rows, no error. Exact kNN: 5.
+   Appendix C: candidates, truth.
 ----------------------------------------------------------------------------- */
 
--- STEP 1: TOP_N = 5 plus the Score filter. Expected: 0 rows.
+-- STEP 1: TOP_N = 5 plus Score filter. Expected: 0 rows.
 DECLARE @search_vector VECTOR(768) = AI_GENERATE_EMBEDDINGS(N'how do I center a div in CSS' USE MODEL ollama);
 
 SELECT t.PostId, p.Score, s.distance
@@ -256,7 +245,7 @@ WHERE p.Score > 5000
 ORDER BY s.distance;
 GO
 
--- STEP 2: Fix it. Oversample: TOP_N ≥ K / selectivity = 5 / 0.0021 ≈ 2,381.
+-- STEP 2: Oversample: TOP_N ≥ K / selectivity = 5 / 0.0021 ≈ 2,381.
 DECLARE @search_vector VECTOR(768) = AI_GENERATE_EMBEDDINGS(N'how do I center a div in CSS' USE MODEL ollama);
 
 SELECT TOP(5) t.PostId, p.Score, s.distance
@@ -270,6 +259,6 @@ FROM VECTOR_SEARCH(
 JOIN dbo.Posts p ON t.PostId = p.Id
 WHERE p.Score > 5000
 ORDER BY s.distance;
--- Now 5 rows, the same ones exact kNN finds. The latest-version index on
--- Azure SQL filters during the walk, so this goes away there.
+-- Now 5 rows, as exact kNN. Azure SQL latest-version filters during the
+-- walk: no issue.
 GO

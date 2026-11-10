@@ -107,9 +107,9 @@ Here's how long things took on my M2 (CU10, Ollama on the host, October 2026):
 | Building the vector index, ~10,000 rows (`MAXDOP = 4`) | ~17 to 18 seconds |
 | First index build after a restart | up to ~6 minutes (an earlier, slower run; I didn't see it again) |
 
-### Step 3: Build the scale database (optional, for Demo 02 §2b)
+### Step 3: Build the scale database (optional, for Demo 02 - 2b)
 
-Demo 02 §2b measures exact search and the index at 1,000,000 rows (optional Appendix M adds recall). That lives in its
+Demo 02 - 2b measures exact search and the index at 1,000,000 rows (optional Appendix M adds recall). That lives in its
 own database, `StackOverflowScale`, so Demo 03's drop-and-rebuild never touches it:
 
 ```bash
@@ -288,7 +288,7 @@ without taking the app down:
 | SA password | `S0methingS@Str0ng!` |
 | Database | `StackOverflow` (and `StackOverflowScale` if you built it) |
 | App login | `rag_app` / `RagP@ss2025!` |
-| Monitoring login | `dba_monitor` / `MonitorP@ss123!` (read-only, used in Demo 03 §4b) |
+| Monitoring login | `dba_monitor` / `MonitorP@ss123!` (read-only, used in Demo 03 - 4b) |
 
 The stack uses port 1435 so it won't collide with a SQL Server you already have on 1433.
 These passwords are for a local demo only. Don't reuse them anywhere real.
@@ -325,15 +325,15 @@ NGINX sits in between and adds the TLS. That's the only reason `model-web` exist
 | Feature | Where |
 |---|---|
 | `VECTOR(n)` data type | All three demos |
-| `VECTOR(n, float16)` half precision (preview) | Demo 01 §1c, optional Appendix A |
-| `AI_GENERATE_EMBEDDINGS` | Demo 01 §2, Demo 03 |
-| `AI_GENERATE_CHUNKS` | Demo 03 §1c |
-| Change Tracking (re-embedding changed rows) | Demo 03 §4b |
-| `VECTOR_DISTANCE` | Demo 01 §3 |
+| `VECTOR(n, float16)` half precision (preview) | Demo 01 - 1c, optional Appendix A |
+| `AI_GENERATE_EMBEDDINGS` | Demo 01 - 2, Demo 03 |
+| `AI_GENERATE_CHUNKS` | Demo 03 - 1c |
+| Change Tracking (re-embedding changed rows) | Demo 03 - 4b |
+| `VECTOR_DISTANCE` | Demo 01 - 3 |
 | `VECTOR_NORM` | Demo 01 optional Appendix B |
-| `CREATE VECTOR INDEX` (DiskANN, preview) | Demo 02 §1 |
-| `VECTOR_SEARCH` | Demo 02 §2, Demo 03 §2 |
-| `CREATE EXTERNAL MODEL` with Ollama | Demo 03 §2 |
+| `CREATE VECTOR INDEX` (DiskANN, preview) | Demo 02 - 1 |
+| `VECTOR_SEARCH` | Demo 02 - 2, Demo 03 - 2 |
+| `CREATE EXTERNAL MODEL` with Ollama | Demo 03 - 2 |
 | `SELECT TOP (N) WITH APPROXIMATE`, `sys.dm_db_vector_indexes` | Demo 02 optional Appendix E, Azure only |
 
 ---
@@ -345,7 +345,7 @@ Here are the problems I hit while building this, and what fixes them.
 | What you see | What's going on |
 |---|---|
 | **Msg 31629**, "external rest endpoint execution exceeded the timeout" | Ollama isn't running, or the model is still loading. Warm it up with `curl -s http://localhost:11434/api/embed -d '{"model":"nomic-embed-text","input":"hi"}'` and try again. |
-| **Msg 42231 or 42232** on INSERT, UPDATE, DELETE, or TRUNCATE | That's expected. On SQL Server 2025 a table is read-only while it has a vector index. Drop the index, load your data, rebuild it. Demo 03 §4a shows how. |
+| **Msg 42231 or 42232** on INSERT, UPDATE, DELETE, or TRUNCATE | That's expected. On SQL Server 2025 a table is read-only while it has a vector index. Drop the index, load your data, rebuild it. Demo 03 - 4a shows how. |
 | **Msg 42266** on `CREATE VECTOR INDEX` | Latest-version indexes (Azure SQL) need at least 100 rows with non-NULL vectors. The earlier-version index on SQL Server 2025 doesn't enforce it. |
 | **Msg 42274** on `VECTOR_SEARCH` | You're on a latest-version index (Azure SQL) and used `TOP_N`. Use `SELECT TOP (N) WITH APPROXIMATE` instead. See Demo 02 optional Appendix I. |
 | **Msg 42227**, "Cannot find a vector index" | `VECTOR_SEARCH` needs a vector index on SQL Server 2025. Rebuild the index. |
@@ -363,7 +363,7 @@ Here are the problems I hit while building this, and what fixes them.
 ./stop.sh --wipe    # stop the containers and delete the data volume
 ```
 
-Demo 03 §4a embeds 100 more questions every time you run it, and §4b rewrites one post title.
+Demo 03 - 4a embeds 100 more questions every time you run it, and 4b rewrites one post title.
 The script's last section (REHEARSAL RESET) restores that title and turns Change Tracking back off.
 If you want to start fresh, run `./stop.sh --wipe`, then `./start.sh` and `bash setup/expand-embeddings.sh`.
 
