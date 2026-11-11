@@ -261,3 +261,22 @@ ORDER BY s.distance;
 -- Now 5 rows, as exact kNN. Azure SQL latest-version filters during the
 -- walk: no issue.
 GO
+
+/* 
+   Azure SQL latest version (not for SQL Server 2025): no TOP_N, no oversampling.
+   Iterative filtering keeps walking the graph until 5 rows pass the filter.
+
+DECLARE @search_vector VECTOR(768) = AI_GENERATE_EMBEDDINGS(N'how do I center a div in CSS' USE MODEL ollama);
+
+SELECT TOP (5) WITH APPROXIMATE t.PostId, p.Score, s.distance
+FROM VECTOR_SEARCH(
+    TABLE      = dbo.QuestionEmbeddings AS t,
+    COLUMN     = [embeddings],
+    SIMILAR_TO = @search_vector,
+    METRIC     = 'cosine'
+) AS s
+JOIN dbo.Posts p ON t.PostId = p.Id
+WHERE p.Score > 5000
+ORDER BY s.distance;
+*/
+GO

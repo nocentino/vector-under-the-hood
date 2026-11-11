@@ -55,7 +55,6 @@ LEFT JOIN sys.filegroups fg ON fg.data_space_id = df.data_space_id
 ORDER BY df.type, fg.data_space_id, df.file_id;
 GO
 
-
 /* =============================================================================
    SECTION 1: THE VECTOR DATA TYPE, WHAT IT IS AT THE BINARY LEVEL
    ============================================================================= */
@@ -73,6 +72,9 @@ GO
    sys.columns.vector_dimensions (optional Appendix C) beats DATALENGTH math
    and is right for float32 and float16.
 ----------------------------------------------------------------------------- */
+SELECT TOP (1) *
+FROM dbo.QuestionEmbeddings;
+
 
 SELECT TOP (1)
     qe.PostId,
@@ -95,7 +97,6 @@ GO
 
 ----------------------------------------------------------------------------- */
 
--- ROW_OVERFLOW_DATA has a catalog row but zero pages.
 SELECT
     fg.name                 AS filegroup_name,
     au.type_desc            AS allocation_unit,
@@ -272,6 +273,23 @@ SELECT VECTOR_DISTANCE('cosine', @v32, @v16);
    model host (Ollama).
 ----------------------------------------------------------------------------- */
 
+
+/* -----------------------------------------------------------------------------
+   The app never writes VECTOR_DISTANCE or VECTOR_SEARCH. A proc owns the model
+   name, index-or-scan choice and oversampling, and returns scalar columns. The
+   model is registered with CREATE EXTERNAL MODEL; LOCATION is HTTPS (SQL Server
+   2025 requires TLS for external calls).
+----------------------------------------------------------------------------- */
+
+SELECT
+    em.name,
+    em.location,
+    em.model_type_desc, -- 'EMBEDDINGS'
+    em.api_format       -- 'Ollama', 'AzureOpenAI', 'OpenAI', etc.
+FROM sys.external_models em;
+GO
+
+
 SET STATISTICS TIME ON;
 GO
 SELECT AI_GENERATE_EMBEDDINGS(N'how do I undo my last git commit' USE MODEL ollama)
@@ -316,7 +334,7 @@ GO
 ----------------------------------------------------------------------------- */
 
 DECLARE @question     VECTOR(768) = AI_GENERATE_EMBEDDINGS(
-    N'how do I undo my last git commit?' USE MODEL ollama);
+ N'how do I undo my last git commit?' USE MODEL ollama);
 
 DECLARE @strong_match VECTOR(768) = AI_GENERATE_EMBEDDINGS(
     N'git revert last commit without losing changes' USE MODEL ollama);
