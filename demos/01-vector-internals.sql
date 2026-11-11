@@ -106,7 +106,7 @@ FROM sys.partitions       p
 JOIN sys.allocation_units au ON au.container_id = p.hobt_id
 JOIN sys.filegroups       fg ON fg.data_space_id = au.data_space_id
 WHERE p.object_id = OBJECT_ID('dbo.QuestionEmbeddings')
-  AND p.index_id  = 1;
+  AND p.index_id  = 1 AND au.type_desc = 'IN_ROW_DATA';
 GO
 
 /* -----------------------------------------------------------------------------
